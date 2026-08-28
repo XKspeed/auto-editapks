@@ -1,206 +1,144 @@
-# XKSpeed APK 修改工具 v1.1
+# XKspeed
 
----
+一个在 Termux 中运行的 APK 自动化处理工具，支持反编译、smali 修改、INI 补丁应用、回编译以及多 APK 批处理。
 
-## 安装
+## 功能
+
+- 检查并安装必要依赖：apktool、unzip、zip、aapt2
+- 支持从 APK 或项目目录反编译
+- 手动修改 smali，提供唯一锚点定位与辅助定位
+- 支持 arsc XML 文件修改
+- 读取并应用 INI 补丁配置
+- 添加额外 dex 文件
+- 回编译生成补丁后的 APK
+- 支持多 APK 批量处理
+- 启动时检查 GitHub 云更新，可选择是否自动更新并重启
+
+## 使用方法
+
+### 环境准备
+
+在 Termux 中安装 Python 和 Git：
 
 ```bash
-pkg install apktool unzip zip aapt2 python -y
+pkg update -y
+pkg install python git -y
 ```
 
----
-
-## 快速开始
+### 下载脚本
 
 ```bash
-cd ~/apk && python xkspeed.py
+git clone https://github.com/XKspeed/auto-editapks.git
+cd auto-editapks
 ```
 
----
+### 运行
 
-## 使用流程
+```bash
+python xkspeed.py
+```
 
-### 1. 反编译
+启动后按菜单提示操作。
 
-将 APK 放入 `input/`，运行程序，选择 APK，选择仅 dex 模式
+### 目录结构
 
-### 2. 修改
+```
+.
+├── xkspeed.py          # 主程序
+├── input/              # 放入待处理 APK
+├── output/             # 输出目录
+├── patch_ini/          # 存放 INI 补丁配置
+├── patch_classes/      # 可选，额外 dex 或 class
+└── save/               # 保存目录
+```
 
-- 手动修改：输入类名 → 选择方法 → 输入 anchor → 选择修改方式
-- INI 加载：选择 INI 文件自动应用
-- 添加 dex：放入 `patch_classes/` 后选择
+## INI 配置
 
-### 3. 回编译
+INI 补丁文件放在 `patch_ini/` 目录下，脚本会自动读取。
 
-输出到 `output/`，文件名：`原名_patched.apk`
-
----
-
-## 手动修改详解
-
-### 输入类名
-
-支持简单类名、完整类名、路径格式、模糊搜索
-
-### 选择方法
-
-- `0` = 整个类
-- 数字 = 对应方法
-- 方法名 = 搜索匹配
-
-### 输入 anchor
-
-程序搜索所有包含 anchor 的行
-
-### 匹配处理
-
-- 唯一匹配：直接显示相对位置
-- 多个匹配：选第 N 处 / 输入 A 全部替换
-- 自动查找辅助定位值（可调范围）
-
-### 修改位置
-
-- 1 个编号 = 替换
-- 2 个编号 = 插入（before/after/replace range）
-
-### 替换方式
-
-- 替换指定字符
-- 替换整行
-
-### 保存到 INI
-
-修改后自动记录，主菜单 [5] 导出
-
----
-
-## INI 配置完整参考
-
-### 元信息 Section
+### 基本结构
 
 ```ini
 [元信息]
-author = 作者名
-tutorial_url = intent://www.coolapk.com/feed/123#Intent;scheme=coolmarket;package=com.coolapk.market;end
-auto_open_tutorial = true
+author = 作者
+tutorial_url = https://example.com
+
+[补丁名称]
+ver = 1.1
+type = smali
+name = 补丁说明
+description = 补丁描述
+file = 目标类名
+method = 目标方法
+anchor = 定位内容
+content = 要写入的内容
+position = before
 ```
 
-| 字段 | 必填 | 说明 | 可选值 |
-|---|---|---|---|
-| author | 否 | 作者署名 | 任意文本 |
-| tutorial_url | 否 | 教程链接 | 网页/APP scheme/intent:// |
-| auto_open_tutorial | 否 | 自动打开 | true / ask / false |
+### 字段说明
 
-### 补丁 Section（1.1）
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `ver` | 是 | INI 配置版本，支持 `1.0` 和 `1.1` |
+| `type` | 否 | 补丁类型，默认 `smali` |
+| `name` | 否 | 补丁名称，默认使用 section 名 |
+| `description` | 否 | 补丁描述 |
+| `file` | 是 | 目标 smali 类，如 `com.example.MainActivity` |
+| `method` | 否 | 目标方法名，留空则在整个类中定位 |
+| `anchor` | 是 | 定位锚点内容 |
+| `content` | 是 | 要插入或替换的内容 |
+| `position` | 否 | `before`、`after` 或 `replace`，默认 `before` |
+
+### 1.1 版本额外字段
 
 ```ini
 [补丁名称]
 ver = 1.1
-type = smali
-method = apply
-check = const p0, 0x7f0300ce
-description = 可选描述
-
-anchor1 = FocusNotificationBlurEffect
-content1 = NotificationRowBlurEffect
-position1 = replace
-replace_all1 = true
-
-anchor2 = const p0, 0x7f03
-content2 = const p0, 0x7f0300ce
-position2 = replace
-replace_line2 = true
-replace_target2 = 0x7f03
-assist2 = 3
-assist_content2 = getResources
-match_index2 = 1
-exclude_content2 = debug
-
-step1_file = com.example.ClassA
-step2_file = com.example.ClassB
+file = com.example.MainActivity
+method = onCreate
+anchor = const-string
+assist = 5
+assist_content = 辅助定位值
+exclude_content = 排除内容
+replace_line = false
+replace_target = 被替换内容
+replace_all = false
+match_index = 1
 ```
 
-### 所有字段说明
+- `assist`：辅助定位搜索范围，默认 5 行
+- `assist_content`：辅助定位值
+- `exclude_content`：命中后排除的内容
+- `replace_line`：是否替换整行，`true` 或 `false`
+- `replace_target`：替换指定字符
+- `replace_all`：是否替换所有匹配
+- `match_index`：多个匹配时选择第几个
 
-| 字段 | 必填 | 说明 | 示例 |
-|---|---|---|---|
-| ver | 是 | 版本号 | 1.1 |
-| type | 否 | 补丁类型 | smali |
-| method | 否 | 限制方法范围 | apply |
-| check | 否 | 已打补丁则跳过 | const p0, 0x7f0300ce |
-| description | 否 | 补丁描述 | 修改模糊效果 |
-| anchor{n} | 是 | 第 n 处定位内容 | FocusNotificationBlurEffect |
-| content{n} | 是 | 第 n 处新内容 | NotificationRowBlurEffect |
-| position{n} | 是 | 修改位置 | replace / before / after |
-| replace_all{n} | 否 | 替换所有匹配 | true / false |
-| match_index{n} | 否 | 指定第 N 处匹配 | 2 |
-| replace_line{n} | 否 | 整行替换 | true / false |
-| replace_target{n} | 否 | 替换指定字符 | Lcom/A; |
-| assist{n} | 否 | 辅助定位范围 | 3 |
-| assist_content{n} | 否 | 辅助定位值 | getResources |
-| exclude_content{n} | 否 | 排除包含此内容的行 | debug |
-| step{n}_file | 是 | 目标类文件 | com.example.Class |
-| file | 是* | 单文件目标（无 step 时） | com.example.Class |
-
-*file 和 step{n}_file 二选一
-
-### 完整示例
+### 元信息
 
 ```ini
 [元信息]
-author = Mari0us
-tutorial_url = intent://www.coolapk.com/feed/73302580#Intent;scheme=coolmarket;package=com.coolapk.market;end
-auto_open_tutorial = true
-
-[修改apply方法]
-ver = 1.1
-type = smali
-method = apply
-check = const p0, 0x7f0300ce
-
-anchor1 = FocusNotificationBlurEffect
-content1 = NotificationRowBlurEffect
-position1 = replace
-replace_all1 = true
-
-anchor2 = const p0, 0x7f03
-content2 = const p0, 0x7f0300ce
-position2 = replace
-replace_line2 = true
-assist2 = 3
-assist_content2 = getResources
-
-step1_file = com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassEffect
-step2_file = com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassFullAodEffect
-step3_file = com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassOnKeyguardEffect
-step4_file = com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassOnKeyguardLightWallPaperEffect
+author = XKspeed
+tutorial_url = https://example.com
+auto_open_tutorial = ask
 ```
 
-### 1.0 兼容
+- `auto_open_tutorial`：`true` 自动打开、`false` 不打开、`ask` 询问
 
-支持加载 1.0 版本 INI（显示过时警告）。1.0 使用 `nearby`/`nearby_content` 代替 `assist`/`assist_content`。
+## 更新
 
----
+脚本启动时会从 GitHub 读取 `update.json`，如果远程版本比本地新，会询问是否更新。
 
-## 目录结构
+`update.json` 格式：
 
-```
-apk/
-├── xkspeed.py
-├── input/          # APK
-├── output/         # 回编译输出
-├── patch_ini/      # INI 补丁
-├── patch_classes/  # 添加 dex
-├── save/           # 工程
-└── temp_build/     # 临时
+```json
+{
+  "version": "1.2",
+  "download_url": "https://github.com/XKspeed/auto-editapks/releases/download/v1.2/xkspeed.py",
+  "description": "更新说明"
+}
 ```
 
----
+## 许可证
 
-## 常见问题
-
-**定位不唯一？** 用更精确 anchor / assist_content / match_index
-
-**回编译失败？** 完整反编译暂不可用，用仅 dex 模式
-
-**退出？** 小写 q
+本项目使用 GPL-3.0 许可证。

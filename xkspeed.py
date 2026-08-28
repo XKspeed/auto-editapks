@@ -15,6 +15,8 @@ import re
 import difflib
 import zlib
 import webbrowser
+import json
+import urllib.request
 
 # ==================== 常量定义 ====================
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +26,9 @@ BUILD_DIR = os.path.join(WORK_DIR, "temp_build")
 PATCH_INI_DIR = os.path.join(WORK_DIR, "patch_ini")
 PATCH_CLASSES_DIR = os.path.join(WORK_DIR, "patch_classes")
 SAVE_DIR = os.path.join(WORK_DIR, "save")
+
+# 脚本版本（云更新用）
+VERSION = "1.2"
 
 # INI 配置版本
 INI_VERSION = "1.1"
@@ -107,6 +112,125 @@ def check_q_input(user_input):
     if user_input and user_input.strip() == 'q':
         return True
     return False
+
+
+# ==================== GitHub 云更新 ====================
+
+UPDATE_JSON_URL = "https://raw.githubusercontent.com/XKspeed/auto-editapks/main/update.json"
+
+
+def check_github_update():
+    """检查 GitHub 云更新，询问用户是否更新，更新后自动重启"""
+
+    clear_screen()
+    print("=" * 60)
+    print("检查 GitHub 云更新")
+    print("=" * 60)
+    print()
+    print(f"当前版本: {VERSION}")
+    print("正在连接更新服务器...")
+    print()
+
+    try:
+        req = urllib.request.Request(UPDATE_JSON_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"⚠️ 无法连接更新服务器: {e}")
+        print()
+        input("按回车继续...")
+        return
+
+    remote_version = str(data.get("version", "")).strip()
+    download_url = str(data.get("download_url", "")).strip()
+    description = str(data.get("description", "")).strip()
+
+    if not remote_version or not download_url:
+        print("⚠️ 远程 update.json 格式错误，缺少 version 或 download_url")
+        print()
+        input("按回车继续...")
+        return
+
+    print(f"远程最新版本: {remote_version}")
+    if description:
+        print(f"更新说明: {description}")
+    print()
+
+    if remote_version == VERSION:
+        print("✅ 当前已是最新版本")
+        print()
+        input("按回车继续...")
+        return
+
+    print("发现新版本！")
+    print()
+    print("是否现在更新？")
+    print("  [Y] 更新并自动重启")
+    print("  [N] 跳过更新")
+    print()
+
+    choice = input("> ").strip().lower()
+    if choice not in ("y", "yes"):
+        print("已跳过更新")
+        print()
+        input("按回车继续...")
+        return
+
+    # 下载新版本
+    print()
+    print("正在下载更新...")
+    print(f"下载地址: {download_url}")
+    print()
+
+    try:
+        req = urllib.request.Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            new_content = resp.read()
+    except Exception as e:
+        print(f"❌ 下载失败: {e}")
+        print()
+        input("按回车继续...")
+        return
+
+    if not new_content.strip():
+        print("❌ 下载内容为空，已取消更新")
+        print()
+        input("按回车继续...")
+        return
+
+    # 备份旧文件
+    current_file = os.path.abspath(__file__)
+    backup_file = f"{current_file}.bak_{VERSION}"
+    try:
+        shutil.copy2(current_file, backup_file)
+        print(f"✅ 旧版本已备份: {os.path.basename(backup_file)}")
+    except Exception as e:
+        print(f"⚠️ 备份失败，但继续更新: {e}")
+
+    # 写入新文件
+    try:
+        with open(current_file, "wb") as f:
+            f.write(new_content)
+        print("✅ 更新完成")
+    except Exception as e:
+        print(f"❌ 写入新版本失败: {e}")
+        print()
+        input("按回车继续...")
+        return
+
+    print()
+    print("正在自动重启...")
+    print()
+    time.sleep(1)
+
+    # 自动重启当前脚本
+    try:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        print(f"⚠️ 自动重启失败，请手动重新运行脚本: {e}")
+        print()
+        input("按回车退出...")
+        sys.exit(0)
 
 
 def check_dependencies():
@@ -3007,6 +3131,7 @@ def main():
     
     for d in [INPUT_DIR, PATCH_CLASSES_DIR, PATCH_INI_DIR]:
         os.makedirs(d, exist_ok=True)
+    check_github_update()
     check_dependencies()
     
     while True:

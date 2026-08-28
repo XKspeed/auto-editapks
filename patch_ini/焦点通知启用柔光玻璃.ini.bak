@@ -1,0 +1,25 @@
+[元信息]
+author = Mari0us
+tutorial_url = intent://www.coolapk.com/feed/73302580#Intent;scheme=coolmarket;package=com.coolapk.market;end
+auto_open_tutorial = ask
+
+[修改apply方法]
+ver = 1.1
+type = smali
+method = apply
+check = const p0, 0x7f0300ce
+anchor1 = FocusNotificationBlurEffect
+content1 = NotificationRowBlurEffect
+position1 = replace
+replace_all1 = true
+anchor2 = const p0, 0x7f03
+content2 = const p0, 0x7f0300ce
+position2 = replace
+replace_line2 = true
+assist2 = 3
+assist_content2 = getResources
+step1_file = com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassEffect
+step2_file = com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassFullAodEffect
+step3_file = com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassOnKeyguardEffect
+step4_file = com.android.systemui.statusbar.notification.style.vieweffect.FocusNotificationGlassOnKeyguardLightWallPaperEffect
+

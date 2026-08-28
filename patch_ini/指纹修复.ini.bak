@@ -1,0 +1,55 @@
+
+
+[rule_2]
+type = smali
+name = 修改MiuiBrightnessController_onChanged
+file = com.android.systemui.controlcenter.policy.MiuiBrightnessController
+method = onChanged
+check = invoke-static {}, Lcom/nikofodsystemuipatch/NikoFODBrightnessServices;->NikoFODUpdateAlphaValueBrightness()V
+step1_anchor = Lcom/android/systemui/controlcenter/policy/MiuiBrightnessController;->mSliderAnimator:Landroid/animation/ValueAnimator;
+step1_content = invoke-static {}, Lcom/nikofodsystemuipatch/NikoFODBrightnessServices;->NikoFODUpdateAlphaValueBrightness()V
+step1_position = before
+dex = ebfb7e95
+
+[rule_3]
+type = smali
+name = 修改MiuiGxzwIconView_setHightlightTransparen
+file = com.miui.keyguard.biometrics.fod.MiuiGxzwIconView
+method = setHightlightTransparen
+check = const v1, 0x38d1b717
+step1_anchor = Landroid/view/WindowManager$LayoutParams;->alpha:F
+step1_content = const v1, 0x38d1b717
+step1_position = replace
+step1_nearby = 3
+step1_nearby_content = 0x0
+step1_replace_line = true
+
+[rule_4]
+type = smali
+name = 修改MiuiGxzwManager_constructor
+file = com.miui.keyguard.biometrics.fod.MiuiGxzwManager
+method = constructor
+check = const v15, 0x38d1b717
+step1_anchor = Landroid/view/WindowManager$LayoutParams;->alpha:F
+step1_content = const v15, 0x38d1b717
+step1_position = replace
+step1_nearby = 3
+step1_nearby_content = 0x0
+step1_replace_line = true
+
+[rule_5]
+type = smali
+name = 修改MiuiGxzwOverlayView$1_doInBackground
+file = com.miui.keyguard.biometrics.fod.MiuiGxzwOverlayView$1
+method = doInBackground
+check = Niko
+	
+	    move-result p0
+step1_anchor = Ljava/lang/Float;->valueOf(F)Ljava/lang/Float;
+step1_content = invoke-static {}, Lcom/nikofodsystemuipatch/NikoFODBrightnessServices;->NikoFODToGetScreenBrightnessAlphaValue()F
+	
+	    move-result p0
+step1_position = before
+step1_nearby = 3
+step1_nearby_content = :goto
+

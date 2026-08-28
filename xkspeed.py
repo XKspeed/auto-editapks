@@ -159,7 +159,6 @@ def check_github_update():
     if remote_version == VERSION:
         print("✅ 当前已是最新版本")
         print()
-        input("按回车继续...")
         return
 
     print("发现新版本！")

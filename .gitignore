@@ -1,0 +1,25 @@
+# 忽略所有文件
+*
+
+# 但不忽略目录本身，否则无法继续向下匹配
+!*/
+
+# 保留 .gitignore 本身
+!.gitignore
+
+# 保留 Markdown 文件
+!*.md
+
+# 保留 Python 文件
+!*.py
+
+# 明确排除备份文件（即使以 .py 结尾）
+*.bak
+*.bak_*
+*_bak_*
+
+# 其他常见忽略项，保持干净
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

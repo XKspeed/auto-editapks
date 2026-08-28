@@ -25,6 +25,10 @@ PATCH_INI_DIR = os.path.join(WORK_DIR, "patch_ini")
 PATCH_CLASSES_DIR = os.path.join(WORK_DIR, "patch_classes")
 SAVE_DIR = os.path.join(WORK_DIR, "save")
 
+# 程序版本
+VERSION = "1.1"
+GITHUB_REPO = "XKspeed/auto-editapks"
+
 # INI 配置版本
 INI_VERSION = "1.1"
 SUPPORTED_INI_VERSIONS = ["1.0", "1.1"]
@@ -567,6 +571,59 @@ def open_tutorial(url):
     
     print(f"⚠️ 无法自动打开，请手动访问: {url}")
     return False
+
+
+def check_update():
+    """检查 GitHub Release 是否有新版本"""
+    import json
+    import urllib.request
+    
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        latest = data.get("tag_name", "").replace("v", "").strip()
+        if not latest or latest == VERSION:
+            return
+        
+        print("=" * 60)
+        print("发现新版本")
+        print("=" * 60)
+        print()
+        print(f"  当前版本: v{VERSION}")
+        print(f"  最新版本: v{latest}")
+        print()
+        print(f"  下载页面: https://github.com/{GITHUB_REPO}/releases/latest")
+        print()
+        
+        choice = input("是否立即更新？(y/n): ").strip().lower()
+        if choice != 'y':
+            return
+        
+        # 获取下载地址
+        assets = data.get("assets", [])
+        if not assets:
+            print("⚠️ Release 没有附加文件")
+            print(f"请手动下载: https://github.com/{GITHUB_REPO}/releases/latest")
+            return
+        
+        download_url = assets[0].get("browser_download_url", "")
+        if not download_url:
+            print("⚠️ 无法获取下载地址")
+            return
+        
+        print(f"📥 正在下载...")
+        urllib.request.urlretrieve(download_url, __file__ + ".tmp")
+        
+        # 替换原文件
+        import shutil
+        shutil.move(__file__ + ".tmp", __file__)
+        
+        print(f"✅ 更新完成！请重新打开程序")
+        sys.exit(0)
+    except:
+        pass
 
 
 # ==================== 手动修改 DEX ====================
@@ -3007,6 +3064,7 @@ def main():
     
     for d in [INPUT_DIR, PATCH_CLASSES_DIR, PATCH_INI_DIR]:
         os.makedirs(d, exist_ok=True)
+    check_update()
     check_dependencies()
     
     while True:

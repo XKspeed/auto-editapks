@@ -127,17 +127,7 @@ auto_open_tutorial = ask
 
 ## 更新
 
-脚本启动时会从 GitHub 读取 `update.json`，如果远程版本比本地新，会询问是否更新。
-
-`update.json` 格式：
-
-```json
-{
-  "version": "1.2",
-  "download_url": "https://github.com/XKspeed/auto-editapks/releases/download/v1.2/xkspeed.py",
-  "description": "更新说明"
-}
-```
+脚本支持自动更新，启动时会检查 GitHub Release 是否有新版本，并询问是否下载更新。
 
 ## 许可证
 

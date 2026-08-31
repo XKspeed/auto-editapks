@@ -17,6 +17,7 @@ import zlib
 import webbrowser
 import json
 import urllib.request
+import select
 
 # ==================== 常量定义 ====================
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +29,7 @@ PATCH_CLASSES_DIR = os.path.join(WORK_DIR, "patch_classes")
 SAVE_DIR = os.path.join(WORK_DIR, "save")
 
 # 脚本版本（云更新用）
-VERSION = "1.2"
+VERSION = "1.3"
 
 # INI 配置版本
 INI_VERSION = "1.1"
@@ -50,9 +51,122 @@ GREEN = '\033[92m'
 RESET = '\033[0m'
 YELLOW = '\033[93m'
 
+LOG_DIR = os.path.join(WORK_DIR, "log")
+LOG_FILE = os.path.join(LOG_DIR, "latest.log")
+
+# ==================== 全局日志重定向（所有输出自动记录） ====================
+import sys
+
+_real_stdout = sys.stdout
+
+class LogRedirector:
+    """拦截 stdout/stderr，终端显示 + 自动写日志"""
+    def __init__(self, filepath, stream, prefix=""):
+        self.filepath = filepath
+        self.stream = stream
+        self.prefix = prefix
+        self._lock = threading.Lock()
+    
+    def write(self, msg):
+        if not msg:
+            return
+        with self._lock:
+            # 终端显示
+            self.stream.write(msg)
+            self.stream.flush()
+            # 写日志
+            try:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                for line in msg.rstrip('\n').split('\n'):
+                    if line.strip():
+                        with open(self.filepath, "a", encoding="utf-8") as f:
+                            f.write(f"[{ts}] {self.prefix}{line}\n")
+            except Exception:
+                pass
+    
+    def flush(self):
+        self.stream.flush()
+
+# 日志队列和后台线程
+_log_queue = None
+_log_thread = None
+_log_running = False
+
+def _log_worker():
+    global _log_running
+    while _log_running:
+        try:
+            msg = _log_queue.get(timeout=1.0)
+            if msg is None:
+                break
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"[{ts}] {msg}\n")
+            except Exception:
+                pass
+        except:
+            continue
+
+def debug_log(msg):
+    """非阻塞日志写入，消息放入队列由后台线程处理"""
+    global _log_queue, _log_thread, _log_running
+    if _log_queue is not None:
+        try:
+            _log_queue.put(msg, block=False)
+        except:
+            pass
+
+def debug_debug_log(msg):
+    """调试日志：只写日志文件，不输出到终端"""
+    global _log_queue, _log_thread, _log_running
+    if _log_queue is not None:
+        try:
+            _log_queue.put("[DEBUG] " + msg, block=False)
+        except:
+            pass
+
+def log_init():
+    global _log_queue, _log_thread, _log_running
+    log_dir = LOG_DIR
+    os.makedirs(log_dir, exist_ok=True)
+    if os.path.exists(LOG_FILE):
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+        try:
+            os.rename(LOG_FILE, os.path.join(log_dir, ts + ".log"))
+        except Exception:
+            pass
+    old_logs = sorted(glob.glob(os.path.join(log_dir, "*.log")))
+    while len(old_logs) > 3:
+        try:
+            os.remove(old_logs.pop(0))
+        except Exception:
+            break
+    # 启动后台日志线程
+    import queue
+    _log_queue = queue.Queue()
+    _log_running = True
+    _log_thread = threading.Thread(target=_log_worker, daemon=True, name="LogWorker")
+    _log_thread.start()
+
+    # 将所有 print / stdout / stderr 自动写入日志
+    sys.stdout = LogRedirector(LOG_FILE, sys.stdout)
+    sys.stderr = LogRedirector(LOG_FILE, sys.stderr, prefix="[ERR] ")
+
+    debug_log("===== session start =====")
 # ==================== 全局状态 ====================
 print_lock = threading.Lock()
 modification_records = []
+
+def _append_arsc_record(record):
+    """同资源多次修改只保留最后一次（按 file + origin + res_name 识别）"""
+    global modification_records
+    key = (record.get("file"), record.get("origin"), record.get("res_name"))
+    for i, r in enumerate(modification_records):
+        if r.get("type") == "arsc" and (r.get("file"), r.get("origin"), r.get("res_name")) == key:
+            modification_records[i] = record
+            return
+    modification_records.append(record)
 
 
 # ==================== 基础工具函数 ====================
@@ -87,25 +201,18 @@ def format_size(size):
 
 def print_progress(desc, percent, size_str="", speed_str=""):
     with print_lock:
-        bar_length = 20
+        bar_length = 30
         filled = int(bar_length * percent / 100) if percent > 0 else 0
         bar = "█" * filled + "░" * (bar_length - filled)
-        desc = desc.replace('\n', ' ')
-        
-        if len(desc) > 50:
-            desc = desc[:47] + "..."
-        
-        if size_str and speed_str:
-            progress_str = f"\r\033[2K  {desc} [{bar}] {percent:3d}%  {size_str} ({speed_str}/s)"
-        else:
-            progress_str = f"\r\033[2K  {desc} [{bar}] {percent:3d}%"
-        
-        sys.stdout.write(progress_str)
-        sys.stdout.flush()
-        
-        if percent >= 100:
-            sys.stdout.write("\n")
+        desc = desc.replace("\n", " ")
 
+        if len(desc) > 28:
+            desc = desc[:25] + "..."
+        desc = desc.ljust(28)
+
+        _real_stdout.write(f"\r\033[2K  {desc}  {size_str}  {speed_str}\n")
+        _real_stdout.write(f"\r\033[2K  [{bar}] {percent:3d}%\n")
+        _real_stdout.flush()
 
 def check_q_input(user_input):
     """统一检查 Q 返回（仅小写 q）"""
@@ -120,7 +227,9 @@ UPDATE_JSON_URL = "https://raw.githubusercontent.com/XKspeed/auto-editapks/main/
 
 
 def check_github_update():
-    """检查 GitHub 云更新，询问用户是否更新，更新后自动重启"""
+    debug_log("check_github_update 开始")
+    """检查 GitHub 云更新，支持按 Enter 跳过"""
+    debug_log("check_github_update 开始")
 
     clear_screen()
     print("=" * 60)
@@ -129,21 +238,52 @@ def check_github_update():
     print()
     print(f"当前版本: {VERSION}")
     print("正在连接更新服务器...")
+    print("（按 Enter 跳过检查）")
     print()
 
-    try:
-        req = urllib.request.Request(UPDATE_JSON_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"⚠️ 无法连接更新服务器: {e}")
+    result_holder = {}
+
+    def fetch_update():
+        debug_log("fetch_update 开始")
+        try:
+            req = urllib.request.Request(UPDATE_JSON_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result_holder["data"] = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            result_holder["error"] = str(e)
+
+    t = threading.Thread(target=fetch_update)
+    t.daemon = True
+    t.start()
+
+    while t.is_alive():
+        ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+        if ready:
+            line = sys.stdin.readline()
+            if line.strip() == "":
+                print("已跳过更新检查")
+                sys.stdout.flush()
+                time.sleep(0.1)
+                return
+
+    if "error" in result_holder:
+        print(f"⚠️ 无法连接更新服务器: {result_holder.get('error', '未知错误')}")
         print()
         input("按回车继续...")
         return
 
+    data = result_holder.get("data", {})
     remote_version = str(data.get("version", "")).strip()
     download_url = str(data.get("download_url", "")).strip()
-    description = str(data.get("description", "")).strip()
+    changelog_url = str(data.get("changelog_url", "")).strip()
+    description = ""
+    if changelog_url:
+        try:
+            req2 = urllib.request.Request(changelog_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req2, timeout=10) as resp2:
+                description = resp2.read().decode("utf-8").strip()
+        except Exception:
+            description = ""
 
     if not remote_version or not download_url:
         print("⚠️ 远程 update.json 格式错误，缺少 version 或 download_url")
@@ -175,7 +315,6 @@ def check_github_update():
         input("按回车继续...")
         return
 
-    # 下载新版本
     print()
     print("正在下载更新...")
     print(f"下载地址: {download_url}")
@@ -197,7 +336,6 @@ def check_github_update():
         input("按回车继续...")
         return
 
-    # 备份旧文件
     current_file = os.path.abspath(__file__)
     backup_file = f"{current_file}.bak_{VERSION}"
     try:
@@ -206,7 +344,6 @@ def check_github_update():
     except Exception as e:
         print(f"⚠️ 备份失败，但继续更新: {e}")
 
-    # 写入新文件
     try:
         with open(current_file, "wb") as f:
             f.write(new_content)
@@ -222,7 +359,6 @@ def check_github_update():
     print()
     time.sleep(1)
 
-    # 自动重启当前脚本
     try:
         os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
@@ -230,14 +366,12 @@ def check_github_update():
         print()
         input("按回车退出...")
         sys.exit(0)
-
-
 def check_dependencies():
+    debug_log("check_dependencies 开始")
     deps = {
         "apktool": ["apktool", "--version"],
         "unzip": ["unzip", "-v"],
         "zip": ["zip", "-v"],
-        "aapt2": ["aapt2", "version"],
     }
 
     missing = []
@@ -259,38 +393,38 @@ def check_dependencies():
             print(f"  ❌ {name}")
             missing.append(name)
 
+    try:
+        r = subprocess.run(["apkeditor", "-v"], capture_output=True, text=True, timeout=5)
+        if r.returncode >= 0:
+            print(f"  ✅ apkeditor")
+        else:
+            print(f"  ❌ apkeditor")
+            missing.append("apkeditor")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        print(f"  ❌ apkeditor")
+        missing.append("apkeditor")
+
     if missing:
         print("\n" + "=" * 60)
         print("缺少以下依赖:")
         print("=" * 60)
         for name in missing:
-            print(f"\n安装 {name}:")
-            print(f"  pkg install {name} -y")
+            if name == "apkeditor":
+                print("\napkeditor 请从 REAndroid/APKEditor releases 下载 jar 并配置")
+            else:
+                print(f"\n安装 {name}:")
+                print(f"  pkg install {name} -y")
 
         print("\n" + "=" * 60)
         choice = input("是否现在安装？(y/n): ").strip().lower()
-        if choice == 'y':
+        if choice == "y":
             for name in missing:
-                print(f"\n安装 {name}...")
-                subprocess.run(["pkg", "install", name, "-y"])
+                if name != "apkeditor":
+                    print(f"\n安装 {name}...")
+                    subprocess.run(["pkg", "install", name, "-y"])
 
-            print("\n重新检查...")
-            still_missing = []
-            for name, test_cmd in deps.items():
-                try:
-                    result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=5)
-                    if result.returncode == 0:
-                        print(f"  ✅ {name}")
-                    else:
-                        print(f"  ❌ {name}")
-                        still_missing.append(name)
-                except (subprocess.TimeoutExpired, FileNotFoundError):
-                    print(f"  ❌ {name}")
-                    still_missing.append(name)
-
-            if still_missing:
-                print("\n仍有依赖未安装，请手动安装后重试")
-                sys.exit(1)
+            print("\n请手动处理 apkeditor 后重试")
+            sys.exit(1)
         else:
             print("请手动安装后再运行")
             sys.exit(1)
@@ -299,25 +433,31 @@ def check_dependencies():
     print("✅ 所有依赖就绪")
     print("=" * 60)
     time.sleep(1)
-
-
 def find_file(pattern, base):
+    debug_log("find_file 开始")
     files = glob.glob(f"{base}/**/{pattern}", recursive=True)
     return files[0] if files else None
 
 
 def find_files(pattern, base):
+    debug_log("find_files 开始")
     return sorted(glob.glob(f"{base}/**/{pattern}", recursive=True))
 
 
 def find_apk_in_project(project_dir):
+    debug_log("find_apk_in_project 开始")
     apk_files = glob.glob(os.path.join(project_dir, "*.apk"))
     if apk_files:
+        # 优先 original.apk
+        for f in apk_files:
+            if os.path.basename(f) == "original.apk":
+                return f
         return apk_files[0]
     return None
 
 
 def resolve_file_path(filename, work_subdir):
+    debug_log("resolve_file_path 开始")
     """解析 arsc XML 文件路径"""
     if not filename:
         return None
@@ -347,6 +487,7 @@ def resolve_file_path(filename, work_subdir):
 
 
 def resolve_smali_file(filename, work_subdir, interactive=True):
+    debug_log("resolve_smali_file 开始")
     """解析 smali 文件路径"""
     if not filename:
         return None
@@ -518,6 +659,7 @@ def extract_unique_marker(line):
 
 
 def find_unique_assist_content(matches, selected_index, search_range, file_lines):
+    debug_log("find_unique_assist_content 开始")
     """查找唯一辅助定位值"""
     
     target_line = matches[selected_index]
@@ -588,6 +730,7 @@ def input_assist_search_range():
 # ==================== 教程链接打开 ====================
 
 def parse_intent_url(intent_url):
+    debug_log("parse_intent_url 开始")
     """解析 intent:// 链接"""
     result = {
         'path': '',
@@ -622,6 +765,7 @@ def parse_intent_url(intent_url):
 
 
 def open_tutorial(url):
+    debug_log("open_tutorial 开始")
     """打开教程链接，支持网页和 APP 链接"""
     import subprocess
     
@@ -694,8 +838,384 @@ def open_tutorial(url):
 
 # ==================== 手动修改 DEX ====================
 
+
+def apkeditor_decode(apk_path, out_dir):
+    debug_log(f"apkeditor_decode 开始: apk={apk_path}, out={out_dir}")
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = ["apkeditor", "d", "-t", "xml", "-dex", "-i", apk_path, "-o", out_dir, "-f"]
+    try:
+        r = subprocess.run(cmd, capture_output=False, text=True, timeout=600)
+        success = r.returncode == 0
+        debug_log(f"apkeditor_decode 完成: {success}")
+        return success, ""
+    except Exception as e:
+        debug_log(f"apkeditor_decode 异常: {e}")
+        return False, str(e)
+
+
+def apkeditor_build(in_dir, out_apk):
+    debug_log(f"apkeditor_build 开始: in={in_dir}, out={out_apk}")
+    cmd = ["apkeditor", "b", "-t", "xml", "-i", in_dir, "-o", out_apk, "-f"]
+    try:
+        r = subprocess.run(cmd, capture_output=False, text=True, timeout=600)
+        success = r.returncode == 0 and os.path.isfile(out_apk)
+        debug_log(f"apkeditor_build 完成: {success}")
+        return success, ""
+    except Exception as e:
+        debug_log(f"apkeditor_build 异常: {e}")
+        return False, str(e)
+
+def _arsc_get_dir(work_subdir):
+    dirs = read_project_config(work_subdir)
+    arsc_res = dirs.get("arsc_res_dir", "")
+    if arsc_res:
+        # 兼容相对路径：统一按 work_subdir 绝对化
+        if not os.path.isabs(arsc_res):
+            arsc_res = os.path.join(work_subdir, arsc_res)
+        # 从 arsc_res_dir 反推 _arsc 根目录
+        return os.path.dirname(os.path.dirname(os.path.dirname(arsc_res)))
+    return os.path.join(work_subdir, "_arsc")
+
+
+def _arsc_ensure_decoded(apk_path, work_subdir):
+    dirs = read_project_config(work_subdir)
+    arsc_res = dirs.get("arsc_res_dir", "")
+    if arsc_res and os.path.isdir(arsc_res):
+        arsc_dir = os.path.dirname(os.path.dirname(os.path.dirname(arsc_res)))
+        return True, arsc_dir, ""
+
+    # 快速反编译（dex_only）后 config.json 没有 arsc_res_dir，这里现场补解码
+    arsc_dir = _arsc_get_dir(work_subdir)
+    _local_apk = os.path.join(work_subdir, "original.apk")
+    if os.path.isfile(_local_apk):
+        apk_path = _local_apk
+    if apk_path and os.path.isfile(apk_path):
+        print("  正在现场解码 ARSC...")
+        ok, msg = apkeditor_decode(apk_path, arsc_dir)
+        if not ok:
+            return False, arsc_dir, "APKEditor 现场解码 ARSC 失败: " + msg
+        write_decompile_config(apk_path, work_subdir, mode="full")
+        dirs = read_project_config(work_subdir)
+        arsc_res = dirs.get("arsc_res_dir", "")
+        if arsc_res and os.path.isdir(arsc_res):
+            arsc_dir = os.path.dirname(os.path.dirname(os.path.dirname(arsc_res)))
+            return True, arsc_dir, ""
+        return False, arsc_dir, "现场解码完成，但仍未找到 arsc_res_dir"
+
+    return False, arsc_dir, "config.json 中没有 arsc_res_dir，且没有可用 APK 路径进行现场解码"
+
+
+def _arsc_scan_types(work_subdir):
+    dirs = read_project_config(work_subdir)
+    arsc_res = dirs.get("arsc_res_dir", "")
+    type_map = {}
+
+    if arsc_res and os.path.isdir(arsc_res):
+        # 手动修改只用 arsc_res_dir，它本身就是 res 根目录
+        res_dirs = [os.path.join(arsc_res, d) for d in os.listdir(arsc_res) if d.startswith("values") and os.path.isdir(os.path.join(arsc_res, d))]
+    else:
+        # 回退：扫描 _arsc/resources/package_*/res
+        arsc_dir = _arsc_get_dir(work_subdir)
+        resources_root = os.path.join(arsc_dir, "resources")
+        res_dirs = []
+        if os.path.isdir(resources_root):
+            for pkg in sorted(os.listdir(resources_root)):
+                res_path = os.path.join(resources_root, pkg, "res")
+                if os.path.isdir(res_path):
+                    res_dirs.extend([os.path.join(res_path, d) for d in os.listdir(res_path) if d.startswith("values") and os.path.isdir(os.path.join(res_path, d))])
+
+    for res_dir in res_dirs:
+        for f in os.listdir(res_dir):
+            if f.endswith(".xml") and f != "public.xml":
+                type_name = f[:-4]
+                type_map.setdefault(type_name, []).append(os.path.join(res_dir, f))
+    return type_map
+
+
+def _arsc_search_name(xml_path, name):
+    """精确匹配资源名：匹配 name=\"xxx\" 或 name='xxx'"""
+    results = []
+    try:
+        with open(xml_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        # 精确匹配 name="资源名" 或 name='资源名'
+        pattern = re.compile(r'name\s*=\s*["\']' + re.escape(name) + r'["\']')
+        for i, line in enumerate(lines):
+            if pattern.search(line):
+                results.append((i, line.rstrip()))
+    except Exception:
+        pass
+    return results
+
+
+def _arsc_replace_value(xml_path, line_idx, new_value):
+    try:
+        with open(xml_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        if line_idx < 0 or line_idx >= len(lines):
+            return False, "行号超出范围"
+        old_line = lines[line_idx]
+        new_line = re.sub(r">.*?<", ">" + new_value + "<", old_line, count=1)
+        lines[line_idx] = new_line
+        with open(xml_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        return True, old_line
+    except Exception as e:
+        return False, str(e)
+
+
+def _arsc_group_items(xml_path, target_name):
+    items = []
+    try:
+        with open(xml_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        in_group = False
+        for i, line in enumerate(lines):
+            if target_name in line and "<" in line and "name=" in line:
+                in_group = True
+                continue
+            if in_group:
+                if line.strip().startswith("</"):
+                    break
+                item_match = re.search(r"name=\"([^\"]+)\"[^>]*>(.*?)<", line)
+                if item_match:
+                    items.append((i, item_match.group(1), item_match.group(2).strip()))
+                else:
+                    val_match = re.search(r">(.*?)<", line)
+                    if val_match:
+                        items.append((i, str(len(items) + 1), val_match.group(1).strip()))
+    except Exception:
+        pass
+    return items
+
+def manual_edit_arsc(apk_path, apk_name, work_subdir):
+    debug_log("manual_edit_arsc 开始")
+    debug_log(f"manual_edit_arsc 开始: apk={apk_path}, name={apk_name}")
+    clear_screen()
+    ok, arsc_dir, msg = _arsc_ensure_decoded(apk_path, work_subdir)
+    if not ok:
+        print(msg)
+        input("按回车返回...")
+        return
+    type_map = _arsc_scan_types(work_subdir)
+    if not type_map:
+        print("未找到可修改的资源类型")
+        input("按回车返回...")
+        return
+    clear_screen()
+    group_types = ["array", "string-array", "style", "plurals"]
+    while True:
+        type_names = list(type_map.keys())
+        for i, t in enumerate(type_names, 1):
+            tag = " [组]" if t in group_types else ""
+            print(f"  [{i}] {t}{tag}  ({len(type_map[t])} 个文件)")
+        print("  [Q] 返回")
+        sel = input("> ").strip().lower()
+        if sel == "q":
+            return
+        try:
+            idx = int(sel)
+            if not (1 <= idx <= len(type_names)):
+                print("输入无效"); continue
+        except Exception:
+            print("输入无效"); continue
+        ftype = type_names[idx - 1]
+        xml_paths = type_map[ftype]
+        while True:
+            name = input("请输入资源 name（Q 返回上一层）: ").strip()
+            if name.lower() == "q":
+                break
+            matches = []
+            for xml_path in xml_paths:
+                for line_idx, old_line in _arsc_search_name(xml_path, name):
+                    matches.append((xml_path, line_idx, old_line))
+            if not matches:
+                print("未找到该 name"); continue
+            if ftype in group_types:
+                xml_path, line_idx, old_line = matches[0]
+                items = _arsc_group_items(xml_path, name)
+                if not items:
+                    print("未解析到子项"); continue
+                for i, (_, item_name, item_val) in enumerate(items, 1):
+                    print(f"  [{i}] {item_name} = {item_val}")
+                print("  [1] 修改第几个"); print("  [2] 全量替换"); print("  [Q] 重新搜索")
+                opt = input("选择: ").strip().lower()
+                if opt == "q":
+                    continue
+                if opt == "1":
+                    try:
+                        idx2 = int(input("第几个: ").strip())
+                    except Exception:
+                        print("无效"); continue
+                    if idx2 < 1 or idx2 > len(items):
+                        print("无效"); continue
+                    new_val = input("新值: ")
+                    real_line = items[idx2 - 1][0]
+                    ok2, old = _arsc_replace_value(xml_path, real_line, new_val)
+                    if ok2:
+                        print(RED + "- " + old.strip() + RESET)
+                        print(GREEN + "+ " + new_val + RESET)
+                        origin_dir = os.path.basename(os.path.dirname(xml_path))
+                        _append_arsc_record({"type": "arsc", "name": f"修改{ftype}_{name}", "file": ftype, "origin": origin_dir, "res_name": name, "new_values": [new_val]})
+                    else:
+                        print(old)
+                elif opt == "2":
+                    vals = []
+                    while True:
+                        v = input()
+                        if v == "":
+                            break
+                        vals.append(v)
+                    ok2, msg2 = _arsc_replace_group_all(xml_path, name, vals)
+                    if ok2:
+                        print(GREEN + "已全量替换" + RESET)
+                        origin_dir = os.path.basename(os.path.dirname(xml_path))
+                        _append_arsc_record({"type": "arsc", "name": f"修改{ftype}_{name}", "file": ftype, "origin": origin_dir, "res_name": name, "new_values": vals})
+                    else:
+                        print(msg2)
+                else:
+                    print("输入无效")
+            else:
+                for i, (xml_path, line_idx, old_line) in enumerate(matches, 1):
+                    d = os.path.basename(os.path.dirname(xml_path))
+                    m = re.search(r"name=\"([^\"]+)\"[^>]*>(.*?)<", old_line)
+                    if m:
+                        print(f"  [{i}] {d}: {m.group(1)} = {m.group(2)}")
+                    else:
+                        print(f"  [{i}] {d}: {old_line.strip()}")
+                print("  [A] 全部"); print("  [Q] 重新搜索")
+                sel2 = input("选择要修改的项: ").strip().lower()
+                if sel2 == "q":
+                    continue
+                if sel2 == "a":
+                    chosen = list(range(len(matches)))
+                else:
+                    try:
+                        chosen = [int(x) - 1 for x in sel2.replace("，", ",").split(",") if x.strip()]
+                        if not all(0 <= i < len(matches) for i in chosen):
+                            print("输入无效"); continue
+                    except Exception:
+                        print("输入无效"); continue
+                new_val = input("新值: ")
+                for i in chosen:
+                    xml_path, line_idx, old_line = matches[i]
+                    ok2, old = _arsc_replace_value(xml_path, line_idx, new_val)
+                    if ok2:
+                        print(RED + "- " + old.strip() + RESET)
+                        print(GREEN + "+ " + new_val + RESET)
+                        origin_dir = os.path.basename(os.path.dirname(xml_path))
+                        _append_arsc_record({"type": "arsc", "name": f"修改{ftype}_{name}", "file": ftype, "origin": origin_dir, "res_name": name, "new_values": [new_val]})
+                    else:
+                        print(old)
+            input("按回车返回主菜单...")
+            return
+
+
+def _arsc_replace_group_all(xml_path, target_name, values):
+    try:
+        with open(xml_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        pattern = re.compile(r"(<[^>]+name=\"" + re.escape(target_name) + r"\"[^>]*>)(.*?)(</[^>]+>)", re.S)
+        new_items = "\n".join("        <item>" + v + "</item>" for v in values)
+        new_block = r"\1\n" + new_items + "\n    \3"
+        new_text, n = pattern.subn(new_block, text)
+        if n == 0:
+            return False, "未找到组"
+        with open(xml_path, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _arsc_parse_array_lines(file_path, target_name):
+    entries = []
+    in_array = False
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            if "<array" in line and target_name in line:
+                in_array = True
+                continue
+            if in_array and "</array>" in line:
+                break
+            if in_array and "<item" in line:
+                m = re.search(r">(.*?)</item>", line, re.S)
+                if m:
+                    entries.append((i, m.group(1).strip()))
+    except Exception:
+        pass
+    return entries
+
+
+def apply_arsc_ini_rule(work_subdir, rule, apk_path=None):
+    debug_log("apply_arsc_ini_rule 开始")
+    ok, arsc_dir, msg = _arsc_ensure_decoded(apk_path, work_subdir)
+    if not ok:
+        return False, msg
+    type_map = _arsc_scan_types(work_subdir)
+    ftype = rule.get("file", "")
+    origin = rule.get("origin", "")
+    if ftype not in type_map:
+        return False, "资源类型不存在: " + ftype
+    targets = []
+    for xml_path in type_map[ftype]:
+        d = os.path.basename(os.path.dirname(xml_path))
+        if origin:
+            if d == "values-" + origin or d == origin:
+                targets.append(xml_path)
+        else:
+            if d == "values":
+                targets.append(xml_path)
+    if not targets:
+        msg = "没有匹配的限定符目录"
+        debug_log(f"apply_arsc_ini_rule: {msg}")
+        return False, msg
+    name = rule.get("name", "")
+    vals = rule.get("new_values", [])
+    idx = rule.get("index", "")
+    applied = 0
+    msgs = []
+    debug_log(f"apply_arsc_ini_rule: 精确匹配资源 name='{name}', 目标文件数={len(targets)}")
+    for xml_path in targets:
+        ok2 = False
+        old = ""
+        if idx:
+            entries = _arsc_parse_array_lines(xml_path, name)
+            if not entries:
+                msgs.append("array not found"); continue
+            try:
+                pos = int(idx)
+            except Exception:
+                msgs.append("index invalid"); continue
+            if pos < 1 or pos > len(entries):
+                msgs.append("index out of range"); continue
+            ok2, old = _arsc_replace_value(xml_path, entries[pos - 1][0], vals[0] if vals else "")
+            debug_log(f"  数组项 {pos}: {'成功' if ok2 else '失败'} {old if ok2 else ''}")
+        elif len(vals) > 1:
+            ok2, old = _arsc_replace_group_all(xml_path, name, vals)
+            debug_log(f"  组替换: {'成功' if ok2 else '失败'} {old if ok2 else ''}")
+        else:
+            res = _arsc_search_name(xml_path, name)
+            if not res:
+                debug_log(f"  apply_arsc_ini_rule: 未找到精确匹配资源 '{name}'")
+                msgs.append("未找到 " + name); continue
+            debug_log(f"  找到匹配 '{name}' 在第{res[0][0]}行")
+            ok2, old = _arsc_replace_value(xml_path, res[0][0], vals[0] if vals else "")
+            debug_log(f"  替换: {'成功' if ok2 else '失败'} {old if ok2 else ''}")
+        if ok2:
+            applied += 1
+            msgs.append("OK " + os.path.basename(xml_path))
+        else:
+            msgs.append(str(old))
+    return applied > 0, "\n".join(msgs)
 def manual_edit_dex(work_subdir):
+    debug_log("manual_edit_dex 开始")
     global modification_records
+    debug_log(f"manual_edit_dex 开始: work_subdir={work_subdir}")
     
     clear_screen()
     print("=" * 60)
@@ -1262,7 +1782,7 @@ def manual_edit_dex(work_subdir):
                 'file': full_class_name,
                 'anchor': anchor,
                 'content': content,
-                'position': 'replace',
+                'position': str(rel_pos) if rel_pos != 0 else 'replace',
                 'replace_line': replace_line,
                 'match_index': selected_match_idx + 1,
             }
@@ -1312,64 +1832,32 @@ def manual_edit_dex(work_subdir):
             print(f"\n✅ 已选择范围: 相对 {rel_pos1:+d} 到 {rel_pos2:+d} (第 {actual_line1 + search_start_offset + 1}-{actual_line2 + search_start_offset + 1} 行)")
             print()
             
-            # 选择插入位置
-            print("请选择插入位置:")
-            print("  [1] 在范围之前插入（before）")
-            print("  [2] 在范围之后插入（after）")
-            print("  [3] 替换整个范围（replace range）")
-            print("  [Q] 返回上一级")
-            print()
-            
-            insert_choice = input("选择插入位置（1/2/3/Q）: ").strip().upper()
-            if insert_choice == 'Q':
-                return
-            
-            # 输入修改内容
+            # 两个位置之间的处理
             content = input_modification_content()
             if content is None:
                 return
             
-            # 应用修改
             new_lines = search_lines.copy()
             content_lines_final = [line.rstrip() for line in content.strip().split('\n') if line.strip()]
             
-            if insert_choice == '1':
-                # before
-                indent = ''
-                for ch in new_lines[actual_line1]:
-                    if ch in (' ', '\t'):
-                        indent += ch
-                    else:
-                        break
-                indented = [indent + line for line in content_lines_final]
-                new_lines[actual_line1:actual_line1] = indented
-                position = 'before'
-            elif insert_choice == '2':
-                # after
-                indent = ''
-                for ch in new_lines[actual_line2]:
-                    if ch in (' ', '\t'):
-                        indent += ch
-                    else:
-                        break
-                indented = [indent + line for line in content_lines_final]
-                new_lines[actual_line2 + 1:actual_line2 + 1] = indented
-                position = 'after'
-            elif insert_choice == '3':
-                # replace range
-                indent = ''
-                for ch in new_lines[actual_line1]:
-                    if ch in (' ', '\t'):
-                        indent += ch
-                    else:
-                        break
-                indented = [indent + line for line in content_lines_final]
-                new_lines[actual_line1:actual_line2 + 1] = indented
-                position = 'replace'
+            indent = ''
+            for ch in new_lines[actual_line1]:
+                if ch in (' ', '\t'):
+                    indent += ch
+                else:
+                    break
+            indented = [indent + line for line in content_lines_final]
+            
+            gap = actual_line2 - actual_line1
+            if gap == 1:
+                # 相邻行：中间插空行 + 内容
+                new_lines.insert(actual_line1 + 1, "")
+                new_lines[actual_line1 + 1:actual_line1 + 1] = indented
+                position = 'between'
             else:
-                print(f"❌ 无效选择")
-                input("\n按回车返回...")
-                return
+                # 中间有多行：替换中间所有行
+                new_lines[actual_line1 + 1:actual_line2] = indented
+                position = 'between'
             
             # 预览
             if not preview_and_confirm(search_lines, new_lines, actual_line1, search_start_offset):
@@ -1459,6 +1947,7 @@ def input_modification_content():
 
 
 def preview_and_confirm(old_lines, new_lines, highlight_idx, line_offset=0):
+    debug_log("preview_and_confirm 开始")
     """预览修改并确认"""
     import difflib
     
@@ -1515,6 +2004,7 @@ def preview_and_confirm(old_lines, new_lines, highlight_idx, line_offset=0):
 
 
 def apply_changes_to_file(filepath, old_lines, new_lines, method_range, method_start_offset, class_content):
+    debug_log("apply_changes_to_file 开始")
     """将修改写回文件"""
     
     if method_range:
@@ -1536,6 +2026,7 @@ def apply_changes_to_file(filepath, old_lines, new_lines, method_range, method_s
 # ==================== INI 相关函数 ====================
 
 def load_ini_metadata(config):
+    debug_log("load_ini_metadata 开始")
     """加载 INI 元信息"""
     metadata = {
         'author': None,
@@ -1559,12 +2050,34 @@ def load_ini_metadata(config):
     return metadata
 
 
+
+
+def parse_arsc_ini_section(config, section):
+    debug_log("parse_arsc_ini_section 开始")
+    rule = {
+        "section": section,
+        "file": config.get(section, "file", fallback="").strip(),
+        "origin": config.get(section, "origin", fallback="").strip(),
+        "name": config.get(section, "name", fallback="").strip(),
+        "index": config.get(section, "index", fallback="").strip(),
+        "new_values": [],
+    }
+    file_alias = {"array": "arrays", "string-array": "arrays", "style": "styles", "plural": "plurals"}
+    rule["file"] = file_alias.get(rule["file"], rule["file"])
+    raw = config.get(section, "new_values", fallback="")
+    for p in raw.split("\n"):
+            rule["new_values"].append(p)
+    return rule
+
+
 def load_unified_ini(ini_files):
+    debug_log("load_unified_ini 开始")
     all_patch_data = []
     all_arsc_rules = []
     outdated_ini_found = False
     
     for ini_path in ini_files:
+        debug_log(f"load_ini file={ini_path}")
         config = configparser.ConfigParser()
         config.read(ini_path, encoding='utf-8')
         
@@ -1609,6 +2122,12 @@ def load_unified_ini(ini_files):
                 continue
             
             patch_type = config.get(section, 'type', fallback='smali').strip().lower()
+            if patch_type == "arsc":
+                rule = parse_arsc_ini_section(config, section)
+                debug_log(f"arsc section={section} rule={rule}")
+                if rule:
+                    all_arsc_rules.append(rule)
+                continue
             patch_name = config.get(section, 'name', fallback=section)
             description = config.get(section, 'description', fallback='').strip()
             
@@ -1634,7 +2153,7 @@ def load_unified_ini(ini_files):
                 print(f"   请尽快更新 INI 到版本 {INI_VERSION}")
                 print()
                 # 使用 1.0 加载逻辑
-                patch_data_list, arsc_rules = load_ini_v1_0(config, section, patch_name, patch_type)
+                patch_data_list, arsc_rules = load_ini_v1_1(config, section, patch_name, patch_type)
                 all_patch_data.extend(patch_data_list)
                 all_arsc_rules.extend(arsc_rules)
             elif ver == "1.1":
@@ -1661,87 +2180,8 @@ def load_unified_ini(ini_files):
     return all_patch_data, all_arsc_rules
 
 
-def load_ini_v1_0(config, section, patch_name, patch_type):
-    """加载 1.0 版本 INI（旧逻辑）"""
-    all_patch_data = []
-    all_arsc_rules = []
-    
-    check_marker_value = config.get(section, 'check', fallback=None)
-    method_name = config.get(section, 'method', fallback=None)
-    filename = config.get(section, 'file', fallback='').strip()
-    force_add_dex = config.get(section, 'dex', fallback='').strip()
-    
-    anchor = config.get(section, 'anchor', fallback='').strip()
-    content = config.get(section, 'content', fallback='').strip()
-    position = config.get(section, 'position', fallback='before').strip().lower()
-    nearby = config.get(section, 'nearby', fallback=None)
-    nearby_content = config.get(section, 'nearby_content', fallback=None)
-    exclude_content = config.get(section, 'exclude_content', fallback=None)
-    replace_line = config.get(section, 'replace_line', fallback='false').strip().lower() == 'true'
-    
-    steps = []
-    
-    has_step = False
-    for key in config.options(section):
-        if re.match(r'^step\d+_', key):
-            has_step = True
-            break
-    
-    if has_step:
-        step_num = 1
-        while True:
-            prefix = f"step{step_num}_"
-            has_step_file = config.has_option(section, f"{prefix}file")
-            has_step_anchor = config.has_option(section, f"{prefix}anchor")
-            
-            if has_step_file or has_step_anchor:
-                step_filename = config.get(section, f"{prefix}file", fallback=filename).strip()
-                step_anchor = config.get(section, f"{prefix}anchor", fallback=anchor).strip()
-                step_content = config.get(section, f"{prefix}content", fallback=content).strip()
-                step_position = config.get(section, f"{prefix}position", fallback=position).strip().lower()
-                step_nearby = config.get(section, f"{prefix}nearby", fallback=nearby)
-                step_nearby_content = config.get(section, f"{prefix}nearby_content", fallback=nearby_content)
-                step_exclude_content = config.get(section, f"{prefix}exclude_content", fallback=exclude_content)
-                step_replace_line = config.get(section, f"{prefix}replace_line", fallback=str(replace_line).lower()).strip().lower() == 'true'
-                step_method = config.get(section, f"{prefix}method", fallback=method_name)
-                
-                step = {
-                    'filename': step_filename,
-                    'anchor': step_anchor,
-                    'content': step_content,
-                    'position': step_position,
-                    'nearby': step_nearby,
-                    'nearby_content': step_nearby_content,
-                    'exclude_content': step_exclude_content,
-                    'replace_line': step_replace_line,
-                    'method': step_method,
-                }
-                steps.append(step)
-                step_num += 1
-            else:
-                break
-    else:
-        if anchor or content:
-            step = {
-                'filename': filename,
-                'anchor': anchor,
-                'content': content,
-                'position': position,
-                'nearby': nearby,
-                'nearby_content': nearby_content,
-                'exclude_content': exclude_content,
-                'replace_line': replace_line,
-                'method': method_name,
-            }
-            steps.append(step)
-    
-    if steps:
-        all_patch_data.append((patch_name, check_marker_value, method_name, steps, force_add_dex))
-    
-    return all_patch_data, all_arsc_rules
-
-
 def load_ini_v1_1(config, section, patch_name, patch_type):
+    debug_log("load_ini_v1_1 开始")
     """加载 1.1 版本 INI（新逻辑）"""
     all_patch_data = []
     all_arsc_rules = []
@@ -1807,121 +2247,15 @@ def load_ini_v1_1(config, section, patch_name, patch_type):
 
 
 def apply_patch_data(base, apk_path, patch_data):
+    debug_log("apply_patch_data 开始")
     """应用补丁数据"""
     
     # 判断数据类型
-    if isinstance(patch_data, dict) and 'n_tags' in patch_data:
-        # 1.1 版本数据
-        return apply_patch_data_v1_1(base, apk_path, patch_data)
-    else:
-        # 1.0 版本数据
-        return apply_patch_data_v1_0(base, apk_path, patch_data)
-
-
-def apply_patch_data_v1_0(base, apk_path, patch_data):
-    """应用 1.0 版本补丁"""
-    
-    if len(patch_data) == 5:
-        patch_name, check_marker_value, method_name, steps, force_add_dex = patch_data
-    else:
-        patch_name, check_marker_value, method_name, steps = patch_data
-        force_add_dex = ''
-    
-    if check_marker_value:
-        first_filename = steps[0].get('filename', '')
-        filepath = resolve_smali_file(first_filename, base, interactive=True)
-        if filepath:
-            with open(filepath, 'rb') as f:
-                content = f.read()
-            if check_marker_value.encode('utf-8') in content:
-                return patch_name, True, "已打过补丁"
-    
-    messages = []
-    all_success = True
-    
-    for i, step in enumerate(steps):
-        filename = step.get('filename', '')
-        anchor = step.get('anchor', '')
-        content = step.get('content', '')
-        position = step.get('position', 'before')
-        nearby = step.get('nearby', None)
-        nearby_content = step.get('nearby_content', None)
-        exclude_content = step.get('exclude_content', None)
-        replace_line = step.get('replace_line', False)
-        method = step.get('method', None)
-        
-        filepath = resolve_smali_file(filename, base, interactive=True)
-        if not filepath:
-            messages.append(f"step{i+1}: 未找到文件 {filename}")
-            all_success = False
-            continue
-        
-        method_range = None
-        
-        if method:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                file_content = f.read()
-            
-            method_pattern = rf'\.method.*{re.escape(method)}.*\n'
-            method_matches = list(re.finditer(method_pattern, file_content, re.IGNORECASE))
-            
-            if not method_matches:
-                messages.append(f"step{i+1}: 未找到方法 {method}")
-                all_success = False
-                continue
-            
-            target_method_match = None
-            
-            if len(method_matches) == 1:
-                target_method_match = method_matches[0]
-            else:
-                for m in method_matches:
-                    method_start = m.start()
-                    method_end = file_content.find(".end method", method_start)
-                    if method_end == -1:
-                        method_end = len(file_content)
-                    else:
-                        method_end += len(".end method")
-                    
-                    method_content = file_content[method_start:method_end]
-                    if anchor.strip() in method_content:
-                        target_method_match = m
-                        break
-                
-                if not target_method_match:
-                    messages.append(f"step{i+1}: 多个方法匹配 {method}，但都不包含 anchor")
-                    all_success = False
-                    continue
-            
-            method_start = target_method_match.start()
-            method_end = file_content.find(".end method", method_start)
-            if method_end == -1:
-                method_end = len(file_content)
-            else:
-                method_end += len(".end method")
-            
-            start_line = file_content[:method_start].count('\n')
-            end_line = file_content[:method_end].count('\n') + 1
-            method_range = (start_line, end_line)
-        
-        ok, msg = apply_patch_step_v1_0(
-            filepath, anchor, content, position,
-            nearby, nearby_content, exclude_content, replace_line,
-            auto_confirm=True,
-            method_range=method_range
-        )
-        
-        if ok:
-            rel = os.path.relpath(filepath, base)
-            messages.append(f"step{i+1} [{rel}]: {msg}")
-        else:
-            messages.append(f"step{i+1}: {msg}")
-            all_success = False
-    
-    return patch_name, all_success, "; ".join(messages)
+    return apply_patch_data_v1_1(base, apk_path, patch_data)
 
 
 def apply_patch_data_v1_1(base, apk_path, patch_data):
+    debug_log("apply_patch_data_v1_1 开始")
     """应用 1.1 版本补丁"""
     
     patch_name = patch_data['name']
@@ -2034,145 +2368,25 @@ def apply_patch_data_v1_1(base, apk_path, patch_data):
     return patch_name, all_success, "; ".join(messages)
 
 
-def apply_patch_step_v1_0(filepath, anchor, content, position, nearby=None, nearby_content=None, exclude_content=None, replace_line=False, auto_confirm=False, method_range=None):
-    """1.0 版本：nearby 二次搜索逻辑"""
-    
-    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+
+def apply_dex_modification_core(filepath, anchor, content, position="before", assist=None, assist_content=None, exclude_content=None, replace_line=False, replace_target=None, method_range=None, replace_all=False, match_index=None, exclude_range=None, dry_run=False):
+    debug_log("apply_dex_modification_core 开始")
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         file_content = f.read()
-    
-    file_lines = file_content.split('\n')
-    target_line_idx = -1
-    
+    file_lines = file_content.split("\n")
     if method_range:
         search_start, search_end = method_range
         search_start = max(0, search_start)
         search_end = min(len(file_lines), search_end)
     else:
         search_start, search_end = 0, len(file_lines)
-    
-    if nearby and nearby_content:
-        anchor_line_indices = []
-        for i in range(search_start, search_end):
-            if anchor.strip() in file_lines[i]:
-                anchor_line_indices.append(i)
-        
-        if anchor_line_indices:
-            for anchor_line_idx in anchor_line_indices:
-                try:
-                    search_range = int(nearby)
-                except Exception:
-                    search_range = 5
-                
-                nearby_start = max(search_start, anchor_line_idx - search_range)
-                nearby_end = min(search_end, anchor_line_idx + search_range + 1)
-                
-                found = False
-                for i in range(nearby_start, nearby_end):
-                    if not file_lines[i].strip():
-                        continue
-                    
-                    if nearby_content.strip() in file_lines[i]:
-                        if exclude_content:
-                            exclude_start = max(search_start, i - 5)
-                            exclude_end = min(search_end, i + 5)
-                            excluded = False
-                            for j in range(exclude_start, exclude_end):
-                                if exclude_content.strip() in file_lines[j]:
-                                    excluded = True
-                                    break
-                            if excluded:
-                                continue
-                        target_line_idx = i
-                        found = True
-                        break
-                
-                if found:
-                    break
-    else:
-        for i in range(search_start, search_end):
-            if anchor.strip() in file_lines[i]:
-                if exclude_content:
-                    exclude_start = max(search_start, i - 5)
-                    exclude_end = min(search_end, i + 5)
-                    excluded = False
-                    for j in range(exclude_start, exclude_end):
-                        if exclude_content.strip() in file_lines[j]:
-                            excluded = True
-                            break
-                    if excluded:
-                        continue
-                target_line_idx = i
-                break
-    
-    if target_line_idx == -1:
-        return False, "未找到定位"
-    
-    content_lines = [line.rstrip() for line in content.strip().split('\n') if line.strip()]
-    new_file_lines = file_lines.copy()
-    
-    if position == 'replace':
-        original_line = new_file_lines[target_line_idx]
-        indent = ''
-        for ch in original_line:
-            if ch in (' ', '\t'):
-                indent += ch
-            else:
-                break
-        
-        if replace_line:
-            new_file_lines[target_line_idx] = indent + content_lines[0] if content_lines else ""
-        else:
-            match_text = nearby_content if nearby and nearby_content else anchor
-            new_file_lines[target_line_idx] = original_line.replace(match_text.strip(), content.strip())
-    elif position == 'before':
-        indent = ''
-        for ch in new_file_lines[target_line_idx]:
-            if ch in (' ', '\t'):
-                indent += ch
-            else:
-                break
-        indented = [indent + line for line in content_lines]
-        new_file_lines[target_line_idx:target_line_idx] = indented
-    elif position == 'after':
-        indent = ''
-        for ch in new_file_lines[target_line_idx]:
-            if ch in (' ', '\t'):
-                indent += ch
-            else:
-                break
-        indented = [indent + line for line in content_lines]
-        new_file_lines[target_line_idx + 1:target_line_idx + 1] = indented
-    else:
-        return False, "position 错误"
-    
-    new_content = '\n'.join(new_file_lines)
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(new_content)
-    
-    return True, "修改成功"
-
-
-def apply_patch_step_v1_1(filepath, anchor, content, position, assist=None, assist_content=None, exclude_content=None, replace_line=False, replace_target=None, auto_confirm=False, method_range=None, replace_all=False, match_index=None):
-    """1.1 版本：anchor 定位 + assist 辅助约束"""
-    
-    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-        file_content = f.read()
-    
-    file_lines = file_content.split('\n')
-    
-    if method_range:
-        search_start, search_end = method_range
-        search_start = max(0, search_start)
-        search_end = min(len(file_lines), search_end)
-    else:
-        search_start, search_end = 0, len(file_lines)
-    
-    # 查找所有 anchor 匹配
     anchor_matches = []
     for i in range(search_start, search_end):
         if anchor.strip() in file_lines[i]:
             if exclude_content:
-                exclude_start = max(search_start, i - 5)
+                er = int(exclude_range) if exclude_range else 5
+                exclude_start = max(search_start, i - er)
+                exclude_end = min(search_end, i + er + 1)
                 exclude_end = min(search_end, i + 5)
                 excluded = False
                 for j in range(exclude_start, exclude_end):
@@ -2182,118 +2396,130 @@ def apply_patch_step_v1_1(filepath, anchor, content, position, assist=None, assi
                 if excluded:
                     continue
             anchor_matches.append(i)
-    
     if not anchor_matches:
         return False, "未找到 anchor"
-    
-    # 确定目标行
     target_line_idx = None
-    
-    # 替换所有匹配时不需要确定单行
-    if replace_all and position == 'replace':
+    if replace_all and position == "replace":
         target_line_idx = anchor_matches[0]
-    
-    # 如果指定了 match_index，直接使用
     if target_line_idx is None and match_index and 0 < match_index <= len(anchor_matches):
         target_line_idx = anchor_matches[match_index - 1]
-    
     if target_line_idx is None and assist_content:
         try:
             assist_range = int(assist) if assist else 5
         except Exception:
             assist_range = 5
-        
+        matched = []
         for anchor_idx in anchor_matches:
             assist_start = max(search_start, anchor_idx - assist_range)
             assist_end = min(search_end, anchor_idx + assist_range + 1)
-            
             found_assist = False
             for i in range(assist_start, assist_end):
                 if assist_content.strip() in file_lines[i]:
                     found_assist = True
                     break
-            
             if found_assist:
-                target_line_idx = anchor_idx
-                break
-        
-        if target_line_idx is None:
-            return False, f"辅助定位值 '{assist_content}' 未在任何 anchor 附近找到"
+                matched.append(anchor_idx)
+        if len(matched) > 1:
+            return False, f"辅助定位值 {assist_content} 有多个，请重新修改 INI"
+        if len(matched) == 1:
+            target_line_idx = matched[0]
+        else:
+            return False, f"辅助定位值 {assist_content} 未在任何 anchor 附近找到"
     elif target_line_idx is None:
         if len(anchor_matches) == 1:
             target_line_idx = anchor_matches[0]
         else:
             return False, f"找到 {len(anchor_matches)} 处匹配，但未提供辅助定位值"
-    
-    # 执行修改
-    content_lines = [line.rstrip() for line in content.strip().split('\n') if line.strip()]
+    content_lines = [line.rstrip() for line in content.strip().split("\n") if line.strip()]
     new_file_lines = file_lines.copy()
-    
-    # 替换所有匹配
-    if replace_all and position == 'replace':
+    if replace_all and position == "replace":
         for match_idx in anchor_matches:
             original_line = new_file_lines[match_idx]
             actual_target = replace_target if replace_target else anchor
             if replace_line:
-                indent = ''
+                indent = ""
                 for ch in original_line:
-                    if ch in (' ', '\t'):
+                    if ch in (" ", "\t"):
                         indent += ch
                     else:
                         break
                 new_file_lines[match_idx] = indent + content_lines[0] if content_lines else ""
             else:
                 new_file_lines[match_idx] = original_line.replace(actual_target.strip(), content.strip())
-        
-        # 跳过后续处理
-        new_content = '\n'.join(new_file_lines)
-        with open(filepath, 'w', encoding='utf-8') as f:
+        new_content = "\n".join(new_file_lines)
+        if dry_run:
+            changed = [k for k in range(min(len(file_lines), len(new_file_lines))) if file_lines[k] != new_file_lines[k]]
+            return True, changed
+        new_content = "\n".join(new_file_lines)
+        with open(filepath, "w", encoding="utf-8") as f:
             f.write(new_content)
         return True, "修改成功"
-    
-    if position == 'replace' and not replace_all:
+
+    if position == "replace" and not replace_all:
         original_line = new_file_lines[target_line_idx]
-        indent = ''
+        indent = ""
         for ch in original_line:
-            if ch in (' ', '\t'):
+            if ch in (" ", "\t"):
                 indent += ch
             else:
                 break
-        
         if replace_line:
             new_file_lines[target_line_idx] = indent + content_lines[0] if content_lines else ""
         else:
             actual_target = replace_target if replace_target else anchor
             new_file_lines[target_line_idx] = original_line.replace(actual_target.strip(), content.strip())
-    elif position == 'before':
-        indent = ''
+    elif position == "before":
+        indent = ""
         for ch in new_file_lines[target_line_idx]:
-            if ch in (' ', '\t'):
+            if ch in (" ", "\t"):
                 indent += ch
             else:
                 break
         indented = [indent + line for line in content_lines]
         new_file_lines[target_line_idx:target_line_idx] = indented
-    elif position == 'after':
-        indent = ''
+    elif position == "after" or position == "between":
+        indent = ""
         for ch in new_file_lines[target_line_idx]:
-            if ch in (' ', '\t'):
+            if ch in (" ", "\t"):
                 indent += ch
             else:
                 break
         indented = [indent + line for line in content_lines]
         new_file_lines[target_line_idx + 1:target_line_idx + 1] = indented
     else:
-        return False, "position 错误"
-    
-    new_content = '\n'.join(new_file_lines)
-    with open(filepath, 'w', encoding='utf-8') as f:
+        try:
+            rel_pos = int(position)
+            actual_idx = target_line_idx + rel_pos
+            if 0 <= actual_idx < len(new_file_lines):
+                if replace_line:
+                    indent = ""
+                    for ch in new_file_lines[actual_idx]:
+                        if ch in (" ", "\t"):
+                            indent += ch
+                        else:
+                            break
+                    new_file_lines[actual_idx] = indent + content_lines[0] if content_lines else ""
+                else:
+                    actual_target = replace_target if replace_target else anchor
+                    new_file_lines[actual_idx] = new_file_lines[actual_idx].replace(actual_target.strip(), content.strip())
+            else:
+                return False, f"无效位置: {rel_pos}"
+        except ValueError:
+            return False, "position 错误"
+    new_content = "\n".join(new_file_lines)
+    if dry_run:
+        changed = [k for k in range(min(len(file_lines), len(new_file_lines))) if file_lines[k] != new_file_lines[k]]
+        return True, changed
+    with open(filepath, "w", encoding="utf-8") as f:
         f.write(new_content)
-    
     return True, "修改成功"
 
 
+def apply_patch_step_v1_1(filepath, anchor, content, position, assist=None, assist_content=None, exclude_content=None, replace_line=False, replace_target=None, auto_confirm=False, method_range=None, replace_all=False, match_index=None):
+    debug_log("apply_patch_step_v1_1 开始")
+    return apply_dex_modification_core(filepath, anchor, content, position, assist, assist_content, exclude_content, replace_line, replace_target, method_range, replace_all, match_index)
 def apply_all_patches(decompiled_dirs, patch_data_list, arsc_rules_list, has_arsc):
+    debug_log("apply_all_patches 开始")
     """统一应用所有补丁"""
     
     patch_results = {}
@@ -2311,11 +2537,28 @@ def apply_all_patches(decompiled_dirs, patch_data_list, arsc_rules_list, has_ars
                 patch_results[apk_name][name] = (ok, msg)
                 
                 status = "✅" if ok else "❌"
+                status_text = "成功" if ok else "失败"
                 if len(decompiled_dirs) > 1:
-                    print(f"  [{apk_name}] {status} {name}: {msg}")
+                    display_msg = f"  [{apk_name}] {status} {name}: {msg}"
+                    print(display_msg)
+                    debug_log(display_msg)
                 else:
-                    print(f"  {status} {name}: {msg}")
+                    display_msg = f"  {status} {name}: {msg}"
+                    print(display_msg)
+                    debug_log(display_msg)
     
+
+    if arsc_rules_list:
+        print("应用 arsc 资源补丁")
+        for d in decompiled_dirs:
+            apk_name, work_subdir, apk_path = d[:3]
+            for rule in arsc_rules_list:
+                ok, msg = apply_arsc_ini_rule(work_subdir, rule, apk_path)
+                status = "✅" if ok else "❌"
+                display_msg = f"  {status} {rule.get("name", "")}: {msg}"
+                print(display_msg)
+                debug_log(display_msg)
+
     if len(decompiled_dirs) > 1:
         print(f"\n{'='*60}")
         print("批量修改总结")
@@ -2340,6 +2583,7 @@ def apply_all_patches(decompiled_dirs, patch_data_list, arsc_rules_list, has_ars
 
 
 def check_patch_compatibility(decompiled_dirs, patch_data_list, arsc_rules_list):
+    debug_log("check_patch_compatibility 开始")
     """检查补丁兼容性"""
     issues = []
     
@@ -2382,6 +2626,7 @@ def check_patch_compatibility(decompiled_dirs, patch_data_list, arsc_rules_list)
 # ==================== 保存修改到 INI ====================
 
 def save_modifications_to_ini():
+    debug_log("save_modifications_to_ini 开始")
     global modification_records
     
     if not modification_records:
@@ -2394,11 +2639,15 @@ def save_modifications_to_ini():
     print("=" * 60)
     print()
     
-    print("修改记录:")
-    for i, record in enumerate(modification_records):
-        print(f"  [{i+1}] {record.get('name', 'unnamed')}")
+    display_names = [r.get('name', 'unnamed') for r in modification_records]
+    selected = select_items("选择要保存的修改记录", modification_records, display_names)
+    if not selected:
+        print("未选择任何记录")
+        input("按回车返回...")
+        return
     
     print()
+    print(f"已选择 {len(selected)} 条记录")
     
     ini_name = input("输入 INI 文件名（Q 返回）: ").strip()
     if check_q_input(ini_name):
@@ -2429,7 +2678,7 @@ def save_modifications_to_ini():
         config.set('元信息', 'auto_open_tutorial', str(auto_open).lower())
     
     # 保存修改记录
-    for i, record in enumerate(modification_records):
+    for i, record in enumerate(selected):
         section_name = record.get('name', f'patch{i+1}')
         # 如果 section 已存在，添加序号
         if config.has_section(section_name):
@@ -2438,6 +2687,21 @@ def save_modifications_to_ini():
                 j += 1
             section_name = f"{section_name}_{j}"
         config.add_section(section_name)
+        if record.get('type') == 'arsc':
+            config.set(section_name, 'ver', '2.0')
+            config.set(section_name, 'type', 'arsc')
+            config.set(section_name, 'file', record.get('file', ''))
+            config.set(section_name, 'name', record.get('res_name', ''))
+            if record.get('origin'):
+                config.set(section_name, 'origin', record['origin'])
+            vals = record.get('new_values', [])
+            if len(vals) == 1:
+                config.set(section_name, 'new_values', vals[0])
+            else:
+                config.set(section_name, 'new_values', chr(10) + chr(10).join(vals) + chr(10) + 'end')
+            if record.get('index'):
+                config.set(section_name, 'index', str(record['index']))
+            continue
         
         config.set(section_name, 'ver', INI_VERSION)
         config.set(section_name, 'type', record.get('type', 'smali'))
@@ -2465,6 +2729,10 @@ def save_modifications_to_ini():
             config.set(section_name, 'assist_content1', record['assist_content'])
         if record.get('exclude_content'):
             config.set(section_name, 'exclude_content1', record['exclude_content'])
+        if record.get('nearby'):
+            config.set(section_name, 'nearby1', str(record['nearby']))
+        if record.get('nearby_content'):
+            config.set(section_name, 'nearby_content1', record['nearby_content'])
     
     with open(ini_path, 'w', encoding='utf-8') as f:
         config.write(f)
@@ -2478,25 +2746,19 @@ def save_modifications_to_ini():
 # ==================== 反编译/回编译函数 ====================
 
 def decompile_apk_parallel(apk_path, work_subdir, apk_size, result_holder, mode, progress_dict, lock):
+    debug_log("decompile_apk_parallel 开始")
     try:
         apk_name = os.path.basename(apk_path)
-        
-        if mode == "dex_only":
-            cmd = ["apktool", "d", "-r", "-f", apk_path, "-o", work_subdir]
-        else:
-            cmd = ["apktool", "d", "-f", apk_path, "-o", work_subdir]
-        
+        cmd = ["apktool", "d", "-r", "-f", apk_path, "-o", work_subdir]
         stop_event = threading.Event()
-        
         def watch():
+            debug_log("watch 开始")
             start_time = time.time()
             last_update = 0
-            
             while not stop_event.is_set():
                 now = time.time()
                 if now - last_update >= PROGRESS_UPDATE_INTERVAL:
                     last_update = now
-                    
                     if os.path.exists(work_subdir):
                         total = 0
                         for root, dirs, files in os.walk(work_subdir):
@@ -2505,64 +2767,144 @@ def decompile_apk_parallel(apk_path, work_subdir, apk_size, result_holder, mode,
                                     total += os.path.getsize(os.path.join(root, f))
                                 except Exception:
                                     pass
-                        
                         percent = int(total / (apk_size * DECOMPILE_SIZE_MULTIPLIER) * 100) if apk_size > 0 else 0
                         percent = min(percent, 99)
-                        
                         size_str = format_size(total)
                         elapsed = now - start_time
                         speed = total / elapsed if elapsed > 0 else 0
                         speed_str = format_size(speed)
-                        
                         with lock:
-                            progress_dict[apk_name] = {
-                                "percent": percent,
-                                "size_str": size_str,
-                                "speed_str": speed_str,
-                            }
-                
+                            progress_dict[apk_name] = {"percent": percent, "size_str": size_str, "speed_str": speed_str}
                 time.sleep(0.2)
-        
         result_holder["done"] = False
-        
         t = threading.Thread(target=watch)
         t.daemon = True
         t.start()
-        
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
         stop_event.set()
         t.join(timeout=1)
-        
+        with lock:
+            progress_dict.pop(apk_name, None)
+        print()
+        if mode == "full":
+            arsc_dir = os.path.join(work_subdir, "_arsc")
+            try:
+                ok, msg = apkeditor_decode(apk_path, arsc_dir)
+                if not ok:
+                    result_holder["error"] = "APKEditor 解 arsc 失败: " + msg
+            except Exception as e:
+                result_holder["error"] = "APKEditor 解 arsc 异常: " + str(e)
         result_holder["done"] = True
         result_holder["success"] = result.returncode == 0
         result_holder["error"] = result.stderr if result.returncode != 0 else None
-        
         if result.returncode == 0:
+            write_decompile_config(apk_path, work_subdir, mode)
             with lock:
-                progress_dict[apk_name] = {
-                    "percent": 100,
-                    "size_str": "",
-                    "speed_str": "",
-                }
-    
+                progress_dict[apk_name] = {"percent": 100, "size_str": "", "speed_str": ""}
     except Exception as e:
         result_holder["success"] = False
         result_holder["error"] = str(e)
+        result_holder["done"] = True
+
+
+def read_project_config(work_subdir):
+    cfg_path = os.path.join(work_subdir, "config.json")
+    try:
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            dirs = data.get("dirs", {})
+            # 所有目录统一转成相对 work_subdir 的绝对路径
+            result = {}
+            for k, v in dirs.items():
+                if v and not os.path.isabs(v):
+                    v = os.path.join(work_subdir, v)
+                result[k] = v
+            info = data.get("info", {})
+            result["is_from_project"] = bool(info.get("is_from_project", False))
+            return result
+    except Exception as e:
+        debug_log("read config.json failed: " + str(e))
+    return {}
+
+
+def write_decompile_config(apk_path, work_subdir, mode="full", is_from_project=False):
+    try:
+        arsc_dir = os.path.join(work_subdir, "_arsc")
+        cfg_path = os.path.join(work_subdir, "config.json")
+        arsc_res_dir = ""
+        resources_root = os.path.join(arsc_dir, "resources")
+        if os.path.isdir(resources_root):
+            for d in sorted(os.listdir(resources_root)):
+                if d.startswith("package_"):
+                    arsc_res_dir = os.path.relpath(os.path.join(resources_root, d, "res"), work_subdir)
+                    break
+        data = {
+            "apk": {
+                "name": os.path.basename(apk_path),
+            },
+            "dirs": {
+                "work_dir": ".",
+                "arsc_res_dir": arsc_res_dir,
+            },
+            "info": {
+                "mode": mode,
+                "is_from_project": bool(is_from_project),
+                "decompiled_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        }
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        debug_log(f"已生成 config.json: {cfg_path}")
+        return True
+    except Exception as e:
+        debug_log(f"生成 config.json 失败: {e}")
+        return False
+
+
+def extract_arsc_from_apk(apk_path, out_path):
+    debug_log("extract_arsc_from_apk 开始")
+    try:
+        import zipfile
+        with zipfile.ZipFile(apk_path, "r") as z:
+            data = z.read("resources.arsc")
+        with open(out_path, "wb") as f:
+            f.write(data)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def recompile_apk(work_subdir, apk_name, apk_path=None):
+    debug_log("recompile_apk 开始")
     output_apk = os.path.join(OUTPUT_DIR_BASE, f"{apk_name}_patched.apk")
-    
+
     print(f"  回编译 {apk_name}...")
-    
+
     os.makedirs(OUTPUT_DIR_BASE, exist_ok=True)
-    
+
     if os.path.exists(output_apk):
         os.remove(output_apk)
-    
+
+    dirs = read_project_config(work_subdir)
+    arsc_res = dirs.get("arsc_res_dir", "")
+    if arsc_res:
+        arsc_dir = os.path.dirname(os.path.dirname(arsc_res))
+    else:
+        arsc_dir = os.path.join(work_subdir, "_arsc")
+    if os.path.isdir(arsc_dir):
+        arsc_build_apk = os.path.join(BUILD_DIR, f"{apk_name}_arsc_build.apk")
+        print("  正在用 APKEditor 回编译 arsc...")
+        ok, msg = apkeditor_build(arsc_dir, arsc_build_apk)
+        if not ok:
+            return False, "APKEditor 回编译 arsc 失败: " + msg
+        ok, msg = extract_arsc_from_apk(arsc_build_apk, os.path.join(work_subdir, "resources.arsc"))
+        if not ok:
+            return False, "提取 arsc 失败: " + msg
+        print("  ✅ 已生成 resources.arsc")
+
     target_size = os.path.getsize(apk_path) if apk_path and os.path.exists(apk_path) else 0
-    
+
     cmd = ["apktool", "b", work_subdir, "-o", output_apk, "-f", "--copy-original"]
     success, stdout, stderr = run_with_progress(
         f"回编译 {apk_name}",
@@ -2573,24 +2915,25 @@ def recompile_apk(work_subdir, apk_name, apk_path=None):
         check_dirs=[os.path.join(work_subdir, "build")],
         size_multiplier=RECOMPILE_SIZE_MULTIPLIER,
     )
-    
+
     if not success:
         if stderr:
             print(f"\n编译错误详情:")
-            stderr_lines = stderr.strip().split('\n')
+            stderr_lines = stderr.strip().split(chr(10))
             for line in stderr_lines[-20:]:
                 print(f"  {line}")
         return False, "编译失败"
-    
+
     if not os.path.exists(output_apk):
         return False, "编译后 output_apk 不存在"
-    
+
     print_progress(f"回编译 {apk_name}", 100, format_size(os.path.getsize(output_apk)), "")
-    
+
     return True, output_apk
 
 
 def recompile_all_dirs(decompiled_dirs):
+    debug_log("recompile_all_dirs 开始")
     total = len(decompiled_dirs)
     success_count = 0
     fail_count = 0
@@ -2616,6 +2959,7 @@ def recompile_all_dirs(decompiled_dirs):
 
 
 def monitor_progress(desc, work_subdir, target_size, stop_event, check_dirs=None, size_multiplier=6):
+    debug_log("monitor_progress 开始")
     start_time = time.time()
     last_update = 0
     
@@ -2660,6 +3004,7 @@ def monitor_progress(desc, work_subdir, target_size, stop_event, check_dirs=None
 
 
 def run_with_progress(desc, work_subdir, target_size, cmd, cwd=None, check_dirs=None, size_multiplier=6):
+    debug_log("run_with_progress 开始")
     stop_event = threading.Event()
     
     t = threading.Thread(
@@ -2688,6 +3033,7 @@ def run_with_progress(desc, work_subdir, target_size, cmd, cwd=None, check_dirs=
 # ==================== 添加 dex ====================
 
 def collect_dex_info(apk_path, build_dir):
+    debug_log("collect_dex_info 开始")
     """收集原 APK 和 build/apk 目录中的 dex 信息"""
     
     info = {
@@ -2731,6 +3077,7 @@ def collect_dex_info(apk_path, build_dir):
 
 
 def get_next_dex_name(next_num):
+    debug_log("get_next_dex_name 开始")
     if next_num <= 1:
         return "classes.dex"
     else:
@@ -2738,6 +3085,7 @@ def get_next_dex_name(next_num):
 
 
 def add_dex_files(decompiled_dirs, selected_dex):
+    debug_log("add_dex_files 开始")
     """添加 dex 文件"""
     
     total_added = 0
@@ -2926,7 +3274,7 @@ def select_decompile_mode():
     print("=" * 60)
     print()
     print("  [1] 仅 dex（跳过资源，快速）")
-    print("  [2] 完整反编译（暂不可用）")
+    print("  [2] 完整反编译（apktool dex + APKEditor arsc）")
     print()
     print("直接回车 = 仅 dex")
     print("-" * 60)
@@ -2937,17 +3285,12 @@ def select_decompile_mode():
         return "dex_only"
     
     if choice == "2":
-        print(f"\n⚠️ 完整反编译暂不可用")
-        print(f"  原因：Android 15 (API 35+) 的 private 资源导致回编译失败")
-        print(f"  已自动切换到仅 dex 模式")
-        input("\n按回车继续...")
-        return "dex_only"
+        return "full"
     return "dex_only"
-
-
 # ==================== 工程保存 ====================
 
 def save_project(work_subdir, apk_name, apk_path=None, is_from_project=False):
+    debug_log("save_project 开始")
     clear_screen()
     print("=" * 60)
     print("保存工程")
@@ -2969,20 +3312,25 @@ def save_project(work_subdir, apk_name, apk_path=None, is_from_project=False):
             return
         shutil.rmtree(dst)
     
-    shutil.copytree(work_subdir, dst)
+    shutil.move(work_subdir, dst)
     
-    if apk_path and os.path.exists(apk_path):
-        apk_basename = os.path.basename(apk_path)
-        shutil.copy2(apk_path, os.path.join(dst, apk_basename))
-        print(f"  ✅ APK 已保存到工程: {apk_basename}")
-    
+    # input 里的原 APK 保持不变，不移动不复制
+    # 更新 config.json，只记录工程内信息
+    _cfg_apk = apk_path if apk_path and os.path.basename(apk_path).endswith(".apk") else (apk_name if apk_name and apk_name.endswith(".apk") else (apk_name + ".apk" if apk_name else "unknown.apk"))
+    try:
+        write_decompile_config(_cfg_apk, dst, is_from_project=is_from_project)
+        print("  ✅ 已更新工程 config.json")
+    except Exception as e:
+        debug_log(f"保存工程后更新 config.json 失败: {e}")
+
     print(f"  ✅ 工程已保存: {dst}")
-    return
+    return dst
 
 
 # ==================== 主菜单 ====================
 
 def unified_main_menu(decompiled_dirs, has_arsc, is_batch, is_from_project=False):
+    debug_log("unified_main_menu 开始")
     global modification_records
     
     patch_data_list = []
@@ -3034,7 +3382,7 @@ def unified_main_menu(decompiled_dirs, has_arsc, is_batch, is_from_project=False
             menu_items.append(("2", "🔧 手动修改 dex（批量不可用）"))
         
         menu_items.append(("3", "📋 从 INI 加载补丁"))
-        menu_items.append(("4", "🚫 手动修改 arsc（暂不可用）"))
+        menu_items.append(("4", "📦 手动修改 arsc"))
         
         if modification_records:
             menu_items.append(("5", "💾 保存修改到 INI"))
@@ -3096,7 +3444,9 @@ def unified_main_menu(decompiled_dirs, has_arsc, is_batch, is_from_project=False
                         if confirm != 'y':
                             continue
                 
-                apply_all_patches(simple_dirs, new_patch_data, [], False)
+                if new_arsc_rules:
+                    arsc_rules_list.extend(new_arsc_rules)
+                apply_all_patches(simple_dirs, new_patch_data, new_arsc_rules, False)
                 
                 if new_patch_data:
                     patch_data_list.extend(new_patch_data)
@@ -3104,17 +3454,26 @@ def unified_main_menu(decompiled_dirs, has_arsc, is_batch, is_from_project=False
                 input("\n按回车继续...")
         
         elif choice == "4":
-            print(f"\n⚠️ arsc 修改功能暂不可用")
-            print(f"  原因：Android 15 (API 35+) 的 private 资源导致回编译失败")
-            print(f"  替代方案：使用mt管理器直接修改 resources.arsc")
-            input("\n按回车返回...")
-        
+            if not decompiled_dirs:
+                print("没有可操作的项目")
+                input("按回车返回...")
+            else:
+                apk_name, work_subdir, apk_path = decompiled_dirs[0][:3]
+                manual_edit_arsc(apk_path, apk_name, work_subdir)
         elif choice == "5" and modification_records:
             save_modifications_to_ini()
         
         elif choice == "6" and not is_batch and not is_from_project:
             apk_name, work_subdir, apk_path = decompiled_dirs[0][:3]
-            save_project(work_subdir, apk_name, apk_path, False)
+            new_dir = save_project(work_subdir, apk_name, apk_path, False)
+            if new_dir:
+                old_entry = decompiled_dirs[0]
+                padded = list(old_entry) + [0] * (5 - len(old_entry))
+                padded[0] = apk_name
+                padded[1] = new_dir
+                padded[2] = apk_path
+                decompiled_dirs[0] = tuple(padded)
+                simple_dirs[0] = (apk_name, new_dir, apk_path)
         
         elif choice == "7":
             recompile_all_dirs(simple_dirs)
@@ -3126,6 +3485,7 @@ def unified_main_menu(decompiled_dirs, has_arsc, is_batch, is_from_project=False
 # ==================== 主函数 ====================
 
 def main():
+    debug_log("main 开始")
     os.chdir(WORK_DIR)
     
     for d in [INPUT_DIR, PATCH_CLASSES_DIR, PATCH_INI_DIR]:
@@ -3189,6 +3549,9 @@ def main():
                             apk_path = None
                         
                         is_from_project = True
+                        _proj_cfg = read_project_config(work_subdir)
+                        if _proj_cfg.get("is_from_project") is False:
+                            is_from_project = False
                         
                         unified_main_menu(
                             [(apk_name, work_subdir, apk_path, 0, 0)],
@@ -3230,8 +3593,6 @@ def main():
                 apk_size = os.path.getsize(apk_path)
                 result_holder = {"success": False, "error": None, "done": False}
                 
-                with progress_lock:
-                    progress_dict[apk_name] = {"percent": 0, "size_str": "", "speed_str": ""}
                 
                 result_holders[apk_name] = result_holder
                 
@@ -3251,34 +3612,28 @@ def main():
                         all_done = False
                         break
                 
+                if not progress_dict:
+                    time.sleep(1)
+                    continue
                 with print_lock:
-                    sys.stdout.write("\033[s")
-                    
-                    lines_to_clear = len(progress_dict)
-                    for _ in range(lines_to_clear):
-                        sys.stdout.write("\033[2K")
-                        sys.stdout.write("\033[1B")
-                    
-                    sys.stdout.write(f"\033[{lines_to_clear}F")
-                    
+                    line_count = len(progress_dict) * 3
+                    _real_stdout.write(f"\033[{line_count}F")
+
                     for apk_name, info in progress_dict.items():
                         percent = info.get("percent", 0)
                         size_str = info.get("size_str", "")
                         speed_str = info.get("speed_str", "")
-                        
-                        bar_length = 20
+
+                        bar_length = 30
                         filled = int(bar_length * percent / 100) if percent > 0 else 0
                         bar = "█" * filled + "░" * (bar_length - filled)
-                        
-                        if size_str and speed_str:
-                            sys.stdout.write(f"\r\033[2K  {apk_name} [{bar}] {percent:3d}%  {size_str} ({speed_str}/s)\n")
-                        else:
-                            sys.stdout.write(f"\r\033[2K  {apk_name} [{bar}] {percent:3d}%\n")
-                    
-                    sys.stdout.write("\033[u")
-                    sys.stdout.flush()
+
+                        _real_stdout.write(f"\033[2K  {apk_name}  {size_str}  {speed_str}\n")
+                        _real_stdout.write(f"\033[2K  [{bar}] {percent:3d}%\n")
+                        _real_stdout.write("\033[2K\n")
+                    _real_stdout.flush()
                 
-                time.sleep(0.5)
+                time.sleep(1)
             
             for apk_name, apk_path, work_subdir, t in threads:
                 t.join()
@@ -3292,6 +3647,16 @@ def main():
                     all_success = False
             
             if all_success and len(decompiled_dirs) == total:
+                # 反编译完成后复制原始 APK 到各工程目录
+                for _apk_name, _work_subdir, _apk_path in decompiled_dirs:
+                    try:
+                        _orig_apk = os.path.join(_work_subdir, "original.apk")
+                        if not os.path.exists(_orig_apk):
+                            shutil.copy2(_apk_path, _orig_apk)
+                            debug_log(f"已复制原始 APK: {_orig_apk}")
+                    except Exception as e:
+                        debug_log(f"复制原始 APK 失败: {e}")
+                clear_screen()
                 unified_main_menu(
                     decompiled_dirs,
                     has_arsc=False,
@@ -3305,4 +3670,128 @@ def main():
 
 
 if __name__ == "__main__":
+    log_init()
     main()
+
+def apply_xml_patch(filepath, anchor, content, position="before", nearby=None, nearby_content=None, assist=None, assist_content=None, exclude_content=None, replace_line=False, replace_target=None, replace_all=False, match_index=1, method_range=None):
+    debug_log("apply_xml_patch 开始")
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            file_content = f.read()
+    except Exception as e:
+        return False, str(e)
+    file_lines = file_content.split("\n")
+    content_lines = [line.rstrip() for line in content.strip().split("\n") if line.strip()]
+    if method_range:
+        search_start, search_end = method_range
+        search_start = max(0, search_start)
+        search_end = min(len(file_lines), search_end)
+    else:
+        search_start, search_end = 0, len(file_lines)
+    matches = []
+    for i in range(search_start, search_end):
+        if anchor.strip() in file_lines[i]:
+            if exclude_content and exclude_content.strip() in file_lines[i]:
+                continue
+            matches.append(i)
+    if not matches:
+        return False, "未找到定位"
+    if replace_all:
+        target_indices = matches
+        target_line_idx = matches[0]
+    elif match_index and 1 <= match_index <= len(matches):
+        target_line_idx = matches[match_index - 1]
+        target_indices = [target_line_idx]
+    else:
+        target_line_idx = matches[0]
+        target_indices = [target_line_idx]
+    if assist and assist_content:
+        try:
+            assist_range = int(assist)
+        except Exception:
+            assist_range = 5
+        for idx in target_indices:
+            nearby_start = max(search_start, idx - assist_range)
+            nearby_end = min(search_end, idx + assist_range + 1)
+            found = False
+            for i in range(nearby_start, nearby_end):
+                if assist_content.strip() in file_lines[i]:
+                    target_line_idx = i
+                    target_indices = [i]
+                    found = True
+                    break
+            if found:
+                break
+    if nearby and nearby_content:
+        try:
+            nearby_range = int(nearby)
+        except Exception:
+            nearby_range = 5
+        for idx in target_indices:
+            nearby_start = max(search_start, idx - nearby_range)
+            nearby_end = min(search_end, idx + nearby_range + 1)
+            found = False
+            for i in range(nearby_start, nearby_end):
+                if nearby_content.strip() in file_lines[i]:
+                    target_line_idx = i
+                    target_indices = [i]
+                    found = True
+                    break
+            if found:
+                break
+    new_file_lines = file_lines.copy()
+    def get_indent(line):
+        indent = ""
+        for ch in line:
+            if ch in (" ", "\t"):
+                indent += ch
+            else:
+                break
+        return indent
+    if position == "replace":
+        if replace_all:
+            for idx in matches:
+                original_line = new_file_lines[idx]
+                indent = get_indent(original_line)
+                if replace_line:
+                    new_file_lines[idx] = indent + (content_lines[0] if content_lines else "")
+                else:
+                    actual_target = replace_target if replace_target else anchor
+                    new_file_lines[idx] = original_line.replace(actual_target.strip(), content.strip())
+        else:
+            original_line = new_file_lines[target_line_idx]
+            indent = get_indent(original_line)
+            if replace_line:
+                new_file_lines[target_line_idx] = indent + (content_lines[0] if content_lines else "")
+            else:
+                actual_target = replace_target if replace_target else anchor
+                new_file_lines[target_line_idx] = original_line.replace(actual_target.strip(), content.strip())
+    elif position == "before":
+        indent = get_indent(new_file_lines[target_line_idx])
+        indented = [indent + line for line in content_lines]
+        new_file_lines[target_line_idx:target_line_idx] = indented
+    elif position == "after" or position == "between":
+        indent = get_indent(new_file_lines[target_line_idx])
+        indented = [indent + line for line in content_lines]
+        new_file_lines[target_line_idx + 1:target_line_idx + 1] = indented
+    else:
+        try:
+            rel = int(position)
+            insert_idx = target_line_idx + rel
+            insert_idx = max(0, min(insert_idx, len(new_file_lines)))
+            indent = get_indent(new_file_lines[target_line_idx])
+            indented = [indent + line for line in content_lines]
+            new_file_lines[insert_idx:insert_idx] = indented
+        except Exception:
+            return False, "position 错误"
+    new_content = "\n".join(new_file_lines)
+    try:
+        if dry_run:
+            changed = [k for k in range(min(len(file_lines), len(new_file_lines))) if file_lines[k] != new_file_lines[k]]
+            return True, changed
+        new_content = "\n".join(new_file_lines)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        return True, "修改成功"
+    except Exception as e:
+        return False, str(e)

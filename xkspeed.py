@@ -29,7 +29,7 @@ PATCH_CLASSES_DIR = os.path.join(WORK_DIR, "patch_classes")
 SAVE_DIR = os.path.join(WORK_DIR, "save")
 
 # 脚本版本（云更新用）
-VERSION = "1.3"
+VERSION = "1.1"
 
 # INI 配置版本
 INI_VERSION = "1.1"
@@ -338,11 +338,13 @@ def check_github_update():
 
     current_file = os.path.abspath(__file__)
     backup_file = f"{current_file}.bak_{VERSION}"
+    # 先重命名当前文件为备份，再写新文件，避免原文件不可写导致更新失败
     try:
-        shutil.copy2(current_file, backup_file)
+        os.replace(current_file, backup_file)
         print(f"✅ 旧版本已备份: {os.path.basename(backup_file)}")
     except Exception as e:
-        print(f"⚠️ 备份失败，但继续更新: {e}")
+        print(f"⚠️ 重命名备份失败: {e}")
+        print("   尝试直接写入新版本...")
 
     try:
         with open(current_file, "wb") as f:
@@ -351,6 +353,7 @@ def check_github_update():
     except Exception as e:
         print(f"❌ 写入新版本失败: {e}")
         print()
+        print("   请手动删除或重命名当前文件后重试")
         input("按回车继续...")
         return
 

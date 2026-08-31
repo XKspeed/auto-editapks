@@ -29,7 +29,7 @@ PATCH_CLASSES_DIR = os.path.join(WORK_DIR, "patch_classes")
 SAVE_DIR = os.path.join(WORK_DIR, "save")
 
 # 脚本版本（云更新用）
-VERSION = "1.1"
+VERSION = "1.3"
 
 # INI 配置版本
 INI_VERSION = "1.1"
